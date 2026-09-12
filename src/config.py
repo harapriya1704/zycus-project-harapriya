@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     #: image-only page if no LLM is configured; raises instead.
     require_vision: bool = Field(default=True)
 
+    # ── LLM structuring (document text -> autodraft) ────────────────────
+    structuring_model: str = Field(default="gpt-4o-mini")
+    structuring_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
+
     # ── Logging ─────────────────────────────────────────────────────────
     log_level: str = Field(default="INFO")
 
