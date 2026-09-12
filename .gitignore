@@ -13,6 +13,7 @@ venv/
 # Project artifacts
 output/
 logs/
+.cache/
 
 # Tooling
 .DS_Store

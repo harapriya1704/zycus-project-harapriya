@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from langchain_core.messages import SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
@@ -103,14 +104,18 @@ def build_autodraft_chain(
     try:
         llm = ChatOpenAI(model=model_name, temperature=temp)
     except Exception as exc:  # typically a missing OPENAI_API_KEY
+        log.error("ChatOpenAI construction failed: %s (%s)", type(exc).__name__, exc)
         raise RuntimeError(
             "Cannot build the structuring chain: no usable OpenAI credentials "
             "configured (set OPENAI_API_KEY)."
         ) from exc
 
+    # The system prompt is passed as a *fixed* SystemMessage (not a template):
+    # it contains literal ``{``/``}`` for the JSON examples, which must not be
+    # treated as f-string replacement fields.
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", _STRUCTURING_SYSTEM_PROMPT),
+            SystemMessage(content=_STRUCTURING_SYSTEM_PROMPT),
             ("human", "Document text:\n\n{document_text}"),
         ]
     )
