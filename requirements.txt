@@ -1,0 +1,26 @@
+# ── Core frameworks ────────────────────────────────────────────────
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.3.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# ── Document ingestion ────────────────────────────────────────────
+# pymupdf renders pages of image-only PDFs to pixels for the vision path
+# and reads text layers directly when one exists.
+pymupdf>=1.24.0
+pypdf>=5.0.0
+
+# ── Runtime / env ─────────────────────────────────────────────────
+python-dotenv>=1.0.0
+tiktoken>=0.7.0
+requests>=2.31.0
+
+# ── API surface (later phases) ────────────────────────────────────
+fastapi>=0.111.0
+uvicorn>=0.30.0
+
+# ── Testing / dev ─────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-cov>=5.0.0
+ruff>=0.5.0
