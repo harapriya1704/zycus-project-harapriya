@@ -1,0 +1,25 @@
+[project]
+name = "agentic-invoice-pipeline"
+version = "0.1.0"
+description = "Agentic invoice processing pipeline — day-1 core extraction and structured output"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain>=0.3.0",
+    "langchain-openai>=0.3.0",
+    "pymupdf>=1.24.0",
+    "pydantic>=2.7.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E501"]
