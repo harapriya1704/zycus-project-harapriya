@@ -7,14 +7,21 @@ in one place instead of scattering them through the code.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 #: Root of the repository: the parent of the ``src`` package directory.
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
+
+#: Load ``.env`` into the process environment so the OpenAI-compatible client
+#: (Groq via ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL``) sees the credentials even
+#: when they are only declared in the file, not the shell.
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 class Settings(BaseSettings):
@@ -44,19 +51,43 @@ class Settings(BaseSettings):
         description="Where rasterised pages are cached.",
     )
 
+    # ── LLM provider (OpenAI-compatible; Groq in production) ─────────────
+    #: Base URL for an OpenAI-compatible endpoint. Defaults to the
+    #: ``OPENAI_BASE_URL`` environment variable (set to Groq in ``.env``).
+    llm_base_url: str = Field(default="")
+    #: API key for that endpoint. Defaults to ``OPENAI_API_KEY``.
+    llm_api_key: str = Field(default="")
+    #: Output token budget for one structured-response call. Kept generous so
+    #: multi-line-item invoices are not truncated mid-JSON by the provider.
+    llm_max_tokens: int = Field(default=4096, ge=256, le=1_000_000)
+
     # ── LLM extraction (vision transcription) ───────────────────────────
-    extraction_model: str = Field(default="gpt-4o")
+    extraction_model: str = Field(default="llama-3.3-70b-versatile")
     extraction_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
     #: When True, refuse to silently return an empty transcription for an
     #: image-only page if no LLM is configured; raises instead.
     require_vision: bool = Field(default=True)
 
     # ── LLM structuring (document text -> autodraft) ────────────────────
-    structuring_model: str = Field(default="gpt-4o-mini")
+    structuring_model: str = Field(default="llama-3.3-70b-versatile")
     structuring_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    # ── Multi-agent validation (day 2) ───────────────────────────────────
+    #: Maximum number of correction iterations in the validation loop; the
+    #: loop hard-stops here to guarantee it cannot run forever.
+    max_retries: int = Field(default=3, ge=1, le=20)
 
     # ── Logging ─────────────────────────────────────────────────────────
     log_level: str = Field(default="INFO")
+
+    # ------------------------------------------------------------------
+    def provider_base_url(self) -> str:
+        """Resolve the LLM provider base URL (setting, else ``OPENAI_BASE_URL``)."""
+        return self.llm_base_url or os.environ.get("OPENAI_BASE_URL", "")
+
+    def provider_api_key(self) -> str:
+        """Resolve the LLM provider API key (setting, else ``OPENAI_API_KEY``)."""
+        return self.llm_api_key or os.environ.get("OPENAI_API_KEY", "")
 
     # ------------------------------------------------------------------
     def resolved_documents_dir(self) -> Path:
