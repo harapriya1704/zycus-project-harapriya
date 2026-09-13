@@ -14,7 +14,6 @@ fake model and later phases can swap OCR vendors without touching callers.
 from __future__ import annotations
 
 import base64
-import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -52,9 +51,9 @@ def _data_uri(image_path: Path) -> str:
     return _PNG_DATA_URI.format(encoded)
 
 
-def _has_api_key(_settings: Settings) -> bool:
+def _has_api_key(settings: Settings) -> bool:
     """True when an OpenAI-compatible key is available for the vision path."""
-    return bool(os.getenv("OPENAI_API_KEY"))
+    return bool(settings.provider_api_key())
 
 
 def build_image_transcription_chain(
@@ -81,7 +80,12 @@ def build_image_transcription_chain(
     temp = cfg.extraction_temperature if temperature is None else temperature
 
     try:
-        llm: BaseChatModel = ChatOpenAI(model=model_name, temperature=temp)
+        llm: BaseChatModel = ChatOpenAI(
+            model=model_name,
+            temperature=temp,
+            base_url=cfg.provider_base_url(),
+            api_key=cfg.provider_api_key(),
+        )
     except Exception as exc:  # pragma: no cover - env-dependent
         log.error("Could not construct ChatOpenAI: %s", exc)
         raise

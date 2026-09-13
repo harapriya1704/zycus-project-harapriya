@@ -1,14 +1,16 @@
 """One-command runner for the day-1 pipeline.
 
-    python run.py [--input-dir DIR] [--output-dir DIR]
+    python run.py [--input-dir DIR] [--output-dir DIR] [--validate]
 
 Processes every ``*.pdf`` in ``documents/`` (default) and writes
 ``output/<name>.json`` for each — the output contract the grader consumes.
+With ``--validate``, each document is routed through the multi-agent
+validation loop (proposer/validator/corrector, capped at ``INV_MAX_RETRIES``
+corrections, default 3) instead of the single-shot structuring chain.
 
 Prerequisites: ``pip install -r requirements.txt`` and an ``OPENAI_API_KEY``
-in the environment (or ``.env``) for document text with an embedded layer of
-fewer than ``INV_TEXT_LAYER_MIN_CHARS`` characters; text-layer documents work
-without a key, but still require one for structured-output generation.
+(plus ``OPENAI_BASE_URL`` for a Groq-compatible endpoint) in the environment
+or ``.env``.
 """
 
 from __future__ import annotations
@@ -18,8 +20,10 @@ import json
 import sys
 from pathlib import Path
 
+from src.agents import ValidationLoop
 from src.config import get_settings
 from src.logging_conf import configure_logging
+from src.master_data import MasterData
 from src.pipeline import process_directory
 
 logger_ready = False
@@ -41,6 +45,8 @@ def _cli(argv: list[str] | None = None) -> int:
     parser.add_argument("--input-dir", type=Path, default=None, help="Folder of PDFs (default: <repo>/documents)")
     parser.add_argument("--output-dir", type=Path, default=None, help="Output folder (default: <repo>/output)")
     parser.add_argument("--log-level", default=None, help="Log level (default: INV_LOG_LEVEL or INFO)")
+    parser.add_argument("--validate", action="store_true",
+                        help="Route documents through the multi-agent validation loop")
     parser.add_argument("--list", action="store_true", help="Only list matching PDFs, then exit")
     args = parser.parse_args(argv)
 
@@ -54,7 +60,13 @@ def _cli(argv: list[str] | None = None) -> int:
             print(pdf.name)
         return 0
 
-    summary = process_directory(documents_dir, output_dir)
+    loop = None
+    if args.validate:
+        loop = ValidationLoop(master=MasterData.load_default(settings=cfg), settings=cfg)
+
+    summary = process_directory(documents_dir, output_dir, validation_loop=loop)
+    if loop is not None:
+        summary["validation"] = loop.stats
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary["files_processed"] else 1
 

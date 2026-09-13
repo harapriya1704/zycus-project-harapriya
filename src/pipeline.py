@@ -17,6 +17,7 @@ from pathlib import Path
 
 from langchain_core.runnables import Runnable
 
+from src.agents import ValidationLoop
 from src.config import Settings, get_settings
 from src.extractor import extract_document_text
 from src.formatter import format_autodraft
@@ -43,6 +44,7 @@ def process_document(
     vision_chain: Runnable | None = None,
     structuring_chain: Runnable | None = None,
     master: MasterData | None = None,
+    validation_loop: ValidationLoop | None = None,
 ) -> FileOutput:
     """Process a single PDF into a :class:`FileOutput`.
 
@@ -52,6 +54,10 @@ def process_document(
         vision_chain: override for the vision transcription runnable (tests).
         structuring_chain: override for the structuring runnable (tests).
         master: override for the master data (tests).
+        validation_loop: when provided, routes the document through the
+            proposer/validator/corrector loop (day-2 agents) instead of the
+            single-shot structuring chain. The loop inherits ``structuring_chain``
+            as its proposer when not set explicitly on the loop.
 
     Returns:
         A validated per-file result; the ``file`` field is the PDF's name.
@@ -71,13 +77,16 @@ def process_document(
         return _decline(exc, pdf_path.name)
 
     try:
-        result = format_autodraft(
-            document_text,
-            filename=pdf_path.name,
-            chain=structuring_chain,
-            master=master,
-            settings=cfg,
-        )
+        if validation_loop is not None:
+            result = validation_loop.run(document_text, pdf_path.name).file_output
+        else:
+            result = format_autodraft(
+                document_text,
+                filename=pdf_path.name,
+                chain=structuring_chain,
+                master=master,
+                settings=cfg,
+            )
     except Exception as exc:  # noqa: BLE001 - e.g. no credentials for text pages
         log.error("%s: structuring failed (%s)", pdf_path.name, exc)
         return _decline(exc, pdf_path.name)
@@ -121,6 +130,7 @@ def process_directory(
     vision_chain: Runnable | None = None,
     structuring_chain: Runnable | None = None,
     master: MasterData | None = None,
+    validation_loop: ValidationLoop | None = None,
 ) -> dict[str, int | Counter]:
     """Process every ``*.pdf`` under ``documents_dir``, writing results.
 
@@ -129,6 +139,9 @@ def process_directory(
         output_dir: destination for per-file JSON.
         settings: settings source.
         vision_chain / structuring_chain / master: stage overrides (tests).
+        validation_loop: day-2 agent loop; when provided, every document goes
+            through propose -> validate -> correct instead of single-shot
+            structuring.
 
     Returns:
         A summary: file counts, payable counts, declined reason tally.
@@ -149,6 +162,7 @@ def process_directory(
             vision_chain=vision_chain,
             structuring_chain=structuring_chain,
             master=master_effective,
+            validation_loop=validation_loop,
         )
         write_output(result, output_dir)
         payable_count += len(result.payables)

@@ -1,16 +1,25 @@
 """Schema-shaped structuring chain (the "structured output" stage).
 
 Takes the extracted text of one PDF and produces a :class:`src.schemas.FileOutput`
-(payables + declined) whose shape is enforced by Pydantic through LangChain's
-``with_structured_output``. The LLM is told to emit **raw** document values and
-to leave every master-data code ``""``; a deterministic resolver
-(:mod:`src.master_data`) fills the codes afterwards so no code is ever guessed.
+(payables + declined) whose shape is enforced by Pydantic. The LLM is told to
+emit **raw** document values and to leave every master-data code ``""``; a
+deterministic resolver (:mod:`src.master_data`) fills the codes afterwards so
+no code is ever guessed.
+
+Provider-agnostic output contract: the model is asked for plain JSON (no
+provider-side strict tool schema), and the reply is validated against the
+Pydantic schema *locally*. Fields the model invented that are not in the
+schema are dropped (large open-weight models often add ``buyer.name`` etc.);
+fields it omitted fall back to their schema defaults.
 """
 
 from __future__ import annotations
 
+import json
+import typing
 from functools import lru_cache
 
+import pydantic
 from langchain_core.messages import SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
@@ -102,7 +111,13 @@ def build_autodraft_chain(
     temp = cfg.structuring_temperature if temperature is None else temperature
 
     try:
-        llm = ChatOpenAI(model=model_name, temperature=temp)
+        llm = ChatOpenAI(
+            model=model_name,
+            temperature=temp,
+            base_url=cfg.provider_base_url(),
+            api_key=cfg.provider_api_key(),
+            max_tokens=cfg.llm_max_tokens,
+        )
     except Exception as exc:  # typically a missing OPENAI_API_KEY
         log.error("ChatOpenAI construction failed: %s (%s)", type(exc).__name__, exc)
         raise RuntimeError(
@@ -119,8 +134,123 @@ def build_autodraft_chain(
             ("human", "Document text:\n\n{document_text}"),
         ]
     )
-    chain: Runnable = prompt | llm.with_structured_output(FileOutput)
+
+    chain: Runnable = prompt | _ask(llm) | _finalize(FileOutput)
     return chain
+
+
+def _ask(llm: ChatOpenAI) -> Runnable:
+    """Runnable mapping a message list to the model's (string) reply."""
+
+    def _invoke(messages) -> str:
+        response = llm.invoke(messages)
+        return str(response.content).strip()
+
+    from langchain_core.runnables import RunnableLambda
+
+    return RunnableLambda(_invoke, name="llm_chat")
+
+
+def _extract_json(text: str) -> str:
+    """Extract the outermost ``{...}`` JSON object from a model reply.
+
+    Models sometimes wrap JSON in markdown fences or add prose; providers may
+    also truncate replies. This is defensive: it returns the largest balanced
+    JSON-ish substring, or the original text unchanged if none is found.
+    """
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    start = cleaned.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(cleaned)):
+        ch = cleaned[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return cleaned[start : i + 1]
+    return cleaned[start:]
+
+
+def _strip_extra(
+    data: object,
+    schema: type[pydantic.BaseModel],
+) -> object:
+    """Recursively keep only fields declared by ``schema``.
+
+    open-weight models (per the Groq target) frequently invent descriptive
+    fields the contract does not allow (e.g. ``buyer.name``, ``buyer.address``).
+    The schema keeps ``extra="forbid"`` for our own writes, so the *parser*
+    boundary is where unknown keys are dropped — deterministically, following
+    the schema itself.
+    """
+
+    def _clean(value: object, ann: object) -> object:
+        if isinstance(value, list):
+            item_anns = typing.get_args(ann) if typing.get_origin(ann) is list else (ann,)
+            item_ann = item_anns[0] if item_anns else ann
+            return [_clean(v, item_ann) for v in value]
+        if isinstance(value, dict) and isinstance(ann, type) and issubclass(ann, pydantic.BaseModel):
+            keep = {}
+            for key, item in value.items():
+                if key not in ann.model_fields:
+                    log.debug("Dropping undeclared field %s.%s", ann.__name__, key)
+                    continue
+                keep[key] = _clean(item, ann.model_fields[key].annotation)
+            return keep
+        return value
+
+    return _clean(data, schema)
+
+
+def _finalize(schema: type[pydantic.BaseModel]) -> Runnable:
+    """Parse+validate the model's JSON string against a Pydantic schema.
+
+    Provider-agnostic: instead of relying on ``with_structured_output``'s
+    server-side tool schema (which some OpenAI-compatible providers — including
+    Groq — enforce so strictly that a model omitting a defaulted field fails),
+    we validate the response locally. Missing fields fall back to their schema
+    defaults; extra fields the model invented are dropped (see ``_strip_extra``).
+    """
+
+    def _parse(text: str) -> pydantic.BaseModel:
+        payload = _extract_json(text)
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            log.error("Model JSON failed to decode (%s); response: %s", exc, payload[:500])
+            raise
+        data = _strip_extra(data, schema)
+        try:
+            return schema.model_validate(data)
+        except pydantic.ValidationError as exc:
+            log.error("Model JSON failed validation (%s); response: %s", exc, payload[:500])
+            raise
+
+    from langchain_core.runnables import RunnableLambda
+
+    return RunnableLambda(_parse, name=f"{schema.__name__}_parser")
 
 
 @lru_cache(maxsize=4)
