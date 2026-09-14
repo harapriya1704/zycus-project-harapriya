@@ -50,6 +50,12 @@ class Settings(BaseSettings):
         default=Path.cwd() / ".cache" / "pages",
         description="Where rasterised pages are cached.",
     )
+    #: Directory vision transcriptions are cached to, so a re-run does not re-spend
+    #: API tokens on pages already transcribed (kept out of the repo).
+    transcription_cache_dir: Path = Field(
+        default=Path.cwd() / ".cache" / "transcriptions",
+        description="Where cached vision transcriptions live.",
+    )
 
     # ── LLM provider (OpenAI-compatible; Groq in production) ─────────────
     #: Base URL for an OpenAI-compatible endpoint. Defaults to the
@@ -58,18 +64,31 @@ class Settings(BaseSettings):
     #: API key for that endpoint. Defaults to ``OPENAI_API_KEY``.
     llm_api_key: str = Field(default="")
     #: Output token budget for one structured-response call. Kept generous so
-    #: multi-line-item invoices are not truncated mid-JSON by the provider.
-    llm_max_tokens: int = Field(default=4096, ge=256, le=1_000_000)
+    #: multi-line-item invoices (now with per-line quantity/unit_price) are not
+    #: truncated mid-JSON by the provider.
+    llm_max_tokens: int = Field(default=16384, ge=256, le=1_000_000)
+    #: Read timeout (seconds) for a single provider call. A hung connection
+    #: becomes ``openai.APITimeoutError`` — which the retry wrapper retries —
+    #: instead of freezing the process/UI forever.
+    llm_timeout: float = Field(default=300.0, ge=1, le=3600)
 
     # ── LLM extraction (vision transcription) ───────────────────────────
-    extraction_model: str = Field(default="llama-3.3-70b-versatile")
+    #: Model that transcribes image-only pages (must support vision/image_url
+    #: input — a text-only model rejects the base64 payload). Read from
+    #: ``INV_VISION_MODEL``; defaults to the multimodal gateway model
+    #: ``qwen/qwen3.8-27b``.
+    vision_model: str = Field(default="qwen/qwen3.8-27b")
     extraction_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
     #: When True, refuse to silently return an empty transcription for an
     #: image-only page if no LLM is configured; raises instead.
     require_vision: bool = Field(default=True)
+    #: Seconds to sleep between consecutive vision-transcription calls within
+    #: one multi-page document. Pacing keeps TPM/RPM usage flat while a batch
+    #: transcribes many scanned pages back-to-back. ``0`` disables it.
+    vision_pacing_delay: float = Field(default=2.0, ge=0.0, le=3600.0)
 
     # ── LLM structuring (document text -> autodraft) ────────────────────
-    structuring_model: str = Field(default="llama-3.3-70b-versatile")
+    structuring_model: str = Field(default="openai/gpt-oss-120b")
     structuring_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
 
     # ── Multi-agent validation (day 2) ───────────────────────────────────
@@ -105,6 +124,10 @@ class Settings(BaseSettings):
     def resolved_render_dir(self) -> Path:
         """Absolute page-raster cache directory."""
         return self._abs(self.pdf_render_dir)
+
+    def resolved_transcription_dir(self) -> Path:
+        """Absolute vision-transcription cache directory."""
+        return self._abs(self.transcription_cache_dir)
 
     @staticmethod
     def _abs(p: Path) -> Path:

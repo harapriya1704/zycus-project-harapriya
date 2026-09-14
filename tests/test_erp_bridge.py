@@ -93,7 +93,8 @@ def test_check_outputs_bridge_runs_clean(tmp_path: Path) -> None:
 
 
 def test_settings_provider_defaults() -> None:
-    """Default model targets the Groq-class llama model; retries capped at 3."""
+    """Vision targets the multimodal gateway model; structuring the text model."""
     cfg = get_settings()
-    assert cfg.structuring_model == "llama-3.3-70b-versatile"
+    assert cfg.vision_model == "qwen/qwen3.8-27b"
+    assert cfg.structuring_model == "openai/gpt-oss-120b"
     assert cfg.max_retries == 3

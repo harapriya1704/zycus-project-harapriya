@@ -39,6 +39,30 @@ from src.schemas import Autodraft, FileOutput
 #: Tolerance (in currency units) for the ERP-recompute vs printed gross check.
 _GROSS_TOLERANCE: float = 0.01
 
+#: Known section-header / subtotal-summary row labels (lowercase). These rows
+#: repeat a category name and carry the section's *aggregated* amount — they are
+#: not atomic charges and would double-count against the ERP price qty x rate.
+_HEADER_PATTERNS: tuple[str, ...] = (
+    "peco electric delivery",
+    "peco electric",
+    "electric supply",
+    "electric delivery",
+    "taxes & fees",
+    "taxes and fees",
+    "total new charges",
+    "total current charges",
+    "total charges",
+    "subtotal",
+)
+
+
+def _to_float(value: object) -> float | None:
+    """Parse a dot-decimal string to float; ``None`` when unparseable."""
+    try:
+        return float(str(value or "").strip())
+    except ValueError:
+        return None
+
 
 class Severity(str, Enum):
     """How strongly an issue blocks the pipeline's correction loop."""
@@ -123,6 +147,7 @@ class MasterDataValidator:
         issues += self._check_unmatched(payable, index)
         issues += self._check_gross(payable, index)
         issues += self._check_lines(payable, index)
+        issues += self._check_tax_duplication(payable, index)
         return [i for i in issues if i is not None]
 
     # ------------------------------------------------------------------
@@ -246,7 +271,13 @@ class MasterDataValidator:
                     message=(
                         f"Amount inconsistency: ERP recomputes gross as {booked_gross:.2f} "
                         f"{booked.get('currency', '')} but the document prints {printed:.2f} "
-                        f"({abs(booked_gross - printed):.2f} difference)."
+                        f"({abs(booked_gross - printed):.2f} difference). NOTE: the ERP does "
+                        "NOT read the printed subtotal / total_tax_amount / gross_total fields. "
+                        "It prices every line_items entry as quantity x unit_price, adds each "
+                        "TAX line's tax_amount, then adds header taxes[] — so a tax booked "
+                        "both as a TAX line and in header taxes[] is added twice. Align "
+                        "line_items + taxes[] so this recompute equals the printed gross; "
+                        "keep every tax in EXACTLY ONE place."
                     ),
                     payable_index=idx,
                 )
@@ -255,33 +286,32 @@ class MasterDataValidator:
 
     # ------------------------------------------------------------------
     def _check_lines(self, p: Autodraft, idx: int) -> list[ValidationIssue]:
-        """Advisory checks for the corrector: line arithmetic and PO presence."""
+        """Checks for the corrector: line completeness, arithmetic and PO presence."""
         issues: list[ValidationIssue] = []
 
         for li_no, line in enumerate(p.line_items):
+            self._check_line_completeness(line, li_no, idx, issues)
+            self._check_header_rows(line, li_no, idx, issues)
             # Line extension should equal qty * unit_price (when both are present).
-            if str(line.quantity or "").strip() and str(line.unit_price or "").strip():
-                try:
-                    computed = float(line.quantity) * float(line.unit_price)
-                except ValueError:
-                    continue
+            qty_f = _to_float(line.quantity)
+            price_f = _to_float(line.unit_price)
+            if qty_f is not None and price_f is not None:
+                computed = qty_f * price_f
                 if str(line.total or "").strip():
-                    try:
-                        printed = float(line.total)
-                    except ValueError:
-                        continue
-                    if abs(computed - printed) > self.gross_tolerance:
-                        issues.append(
-                            ValidationIssue(
-                                field=f"line_items[{li_no}].total",
-                                severity=Severity.WARNING,
-                                message=(
-                                    f"Line {li_no + 1}: qty x price = {computed:.2f} but the line "
-                                    f"extension prints {printed:.2f}."
-                                ),
-                                payable_index=idx,
+                    printed = _to_float(line.total)
+                    if printed is not None:
+                        if abs(computed - printed) > self.gross_tolerance:
+                            issues.append(
+                                ValidationIssue(
+                                    field=f"line_items[{li_no}].total",
+                                    severity=Severity.WARNING,
+                                    message=(
+                                        f"Line {li_no + 1}: qty x price = {computed:.2f} but the line "
+                                        f"extension prints {printed:.2f}."
+                                    ),
+                                    payable_index=idx,
+                                )
                             )
-                        )
 
         if p.po_number and not p.po_id:
             issues.append(
@@ -295,6 +325,126 @@ class MasterDataValidator:
                     payable_index=idx,
                 )
             )
+        return issues
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _check_line_completeness(
+        line: Any,
+        li_no: int,
+        idx: int,
+        issues: list[ValidationIssue],
+    ) -> None:
+        """Flag non-tax lines that carry a total but no quantity/unit_price.
+
+        The ERP prices a line as quantity x unit_price; an empty price books
+        the line as ZERO, silently under-stating the gross. Tax lines are the
+        exception — they are priced from ``tax_amount`` / ``tax_rate``.
+        """
+        if line.item_type == "TAX":
+            return
+        total = _to_float(line.total)
+        if total is None or total == 0.0:
+            return
+        if not (str(line.quantity or "").strip() and str(line.unit_price or "").strip()):
+            issues.append(
+                ValidationIssue(
+                    field=f"line_items[{li_no}].unit_price",
+                    severity=Severity.ERROR,
+                    message=(
+                        f"Line {li_no + 1} ('{line.description or ''}'): total {line.total} is set "
+                        "but quantity/unit_price is missing. Line items must have explicit "
+                        "quantity and unit_price. If missing, set "
+                        f"quantity = '1' and unit_price = '{line.total}' (equal to the line total)."
+                    ),
+                    payable_index=idx,
+                )
+            )
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _check_header_rows(
+        line: Any,
+        li_no: int,
+        idx: int,
+        issues: list[ValidationIssue],
+    ) -> None:
+        """Flag category-header / subtotal-summary rows as ERROR.
+
+        Headers such as "PECO ELECTRIC DELIVERY", "ELECTRIC SUPPLY" or
+        "TAXES & FEES" repeat a section name and carry the section's aggregated
+        amount; they are not atomic charges. Keeping them double-counts the
+        ERP's qty x price book. On removal the header totals must be
+        re-derived, otherwise the ERP oracle check fails.
+        """
+        name = str(line.description or "").strip().lower()
+        if not name:
+            return
+        flagged = any(pattern in name for pattern in _HEADER_PATTERNS)
+        if not flagged:
+            return
+        issues.append(
+            ValidationIssue(
+                field=f"line_items[{li_no}]",
+                severity=Severity.ERROR,
+                message=(
+                    f"Line {li_no + 1} ('{line.description}') is a category header / "
+                    "subtotal summary row, not an atomic charge. DELETE it from "
+                    "line_items. Then recompute the printable totals from the "
+                    "remaining lines: subtotal = sum of non-tax line totals, "
+                    "total_tax_amount = sum of item_type TAX line totals, and "
+                    "gross_total = subtotal + total_tax_amount (rounded to 2 "
+                    "decimals)."
+                ),
+                payable_index=idx,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _check_tax_duplication(p: Autodraft, idx: int) -> list[ValidationIssue]:
+        """Flag taxes booked twice: as a TAX line AND in header taxes[].
+
+        ``erp.erp_book`` adds ``item_type == "TAX"`` rows' ``tax_amount`` and
+        then the header ``taxes[]`` amounts — a tax present in both places is
+        booked twice. Keep each tax in exactly one of the two slots.
+        """
+        if not p.taxes:
+            return []
+
+        def _norm(s: object) -> str:
+            return str(s or "").strip().lower()
+
+        header_keys = {
+            (_norm(t.tax_name), round(float(_to_float(t.tax_amount) or 0.0), 2))
+            for t in p.taxes
+            if _to_float(t.tax_amount) is not None
+        }
+        issues: list[ValidationIssue] = []
+        for li_no, line in enumerate(p.line_items):
+            if line.item_type != "TAX":
+                continue
+            amount = _to_float(line.tax_amount)
+            if amount is None:
+                amount = _to_float(line.total)
+            if amount is None:
+                continue
+            key = (_norm(line.description), round(float(amount), 2))
+            if key in header_keys:
+                issues.append(
+                    ValidationIssue(
+                        field="taxes[]",
+                        severity=Severity.ERROR,
+                        message=(
+                            f"Tax '{line.description}' ({amount:.2f}) is booked twice: "
+                            f"as line_items[{li_no}] (item_type TAX) AND in header taxes[]. "
+                            "The ERP adds both, inflating gross. Keep it in EXACTLY ONE "
+                            "place — remove it from header taxes[] (or, if you intend it "
+                            "as a header tax, remove the TAX line row instead)."
+                        ),
+                        payable_index=idx,
+                    )
+                )
         return issues
 
     # ------------------------------------------------------------------

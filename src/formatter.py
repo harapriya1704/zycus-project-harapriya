@@ -26,6 +26,7 @@ from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
 
 from src.config import Settings, get_settings
+from src.llm_retry import describe_error, invoke_with_retry
 from src.logging_conf import get_logger
 from src.master_data import MasterData
 from src.schemas import Autodraft, Declined, FileOutput
@@ -69,6 +70,26 @@ HARD RULES:
 - unit_price is NET (tax-exclusive). Place each tax where the document places
   it: a tax shown per line goes on that line (line taxes[] or tax_rate/
   tax_amount); a tax shown once at the header goes in the header taxes[].
+- quantity and unit_price are MANDATORY on every GOODS / SERVICE / FREIGHT
+  line; the ERP prices a line as quantity x unit_price, so an empty price
+  books the line as ZERO. Never leave them "" on a non-tax line.
+    * When the document prints an explicit quantity and rate — e.g.
+      "219744 KH * $0.0595/KH" or "475 kW X 4.77000" — set quantity to the raw
+      count ("219744", "475") and unit_price to the rate ("0.0595", "4.77000"),
+      dropping any unit label ("KH", "kW") and currency symbol.
+    * For a flat-fee / lump-sum line with no printed quantity (e.g. "Customer
+      Charge ... 299.78"), set quantity = "1" and unit_price equal to the line
+      total exactly as printed. This default quantity "1" is a convention, not
+      a value taken from the page.
+- EXCLUDE category headers and subtotal / grand-total summaries from
+  line_items: rows such as "Electric", "PECO ELECTRIC DELIVERY",
+  "ELECTRIC SUPPLY", "TAXES & FEES", "Total New Charges", "Total Current
+  Charges" are NOT atomic charges. Extract only atomic line charges — a single
+  quantity x rate or a single flat fee — never a subtotal that aggregates
+  other lines.
+- item_type TAX lines carry their value in total / tax_amount; leave their
+  quantity and unit_price "" (the ERP reads taxes from tax_amount / rate, not
+  from qty x price).
 - tax_amount may be "" — the ERP derives it from tax_rate. Use a negative
   tax_amount for withholding taxes that reduce what is owed.
 - A credit is invoice_type "CREDIT_MEMO" with the same keys, positive values.
@@ -94,8 +115,7 @@ def build_autodraft_chain(
     drifting keys or wrong types) before any downstream code sees it.
 
     Args:
-        model: chat model name; defaults to ``INV_STRUCTURING_MODEL`` or
-            ``INV_EXTRACTION_MODEL``.
+        model: chat model name; defaults to ``INV_STRUCTURING_MODEL``.
         temperature: sampling temperature; defaults to the configured value.
         settings: settings source; defaults to the process singleton.
 
@@ -117,6 +137,7 @@ def build_autodraft_chain(
             base_url=cfg.provider_base_url(),
             api_key=cfg.provider_api_key(),
             max_tokens=cfg.llm_max_tokens,
+            timeout=cfg.llm_timeout,
         )
     except Exception as exc:  # typically a missing OPENAI_API_KEY
         log.error("ChatOpenAI construction failed: %s (%s)", type(exc).__name__, exc)
@@ -143,7 +164,11 @@ def _ask(llm: ChatOpenAI) -> Runnable:
     """Runnable mapping a message list to the model's (string) reply."""
 
     def _invoke(messages) -> str:
-        response = llm.invoke(messages)
+        try:
+            response = invoke_with_retry(llm, messages)
+        except Exception as exc:  # noqa: BLE001 - surface the raw provider error
+            log.error("Structuring LLM call failed: %s", describe_error(exc))
+            raise
         return str(response.content).strip()
 
     from langchain_core.runnables import RunnableLambda

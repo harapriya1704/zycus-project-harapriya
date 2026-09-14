@@ -22,6 +22,7 @@ The vision: an accounts-payable team approves exceptions instead of keying docum
 - **~90% reduction in manual processing time.** Human effort moves from data-entry to exception review. A modern AP headcount processes ~1,500 invoices/month; an agent pipeline with this accuracy reduces that window to reviewing only the flagged exceptions.
 - **100% schema compliance by construction.** Every record is emitted through a Pydantic model that mirrors `AUTODRAFT_SCHEMA.md` exactly — the machine cannot emit a malformed payable, and the contract boundary rejects (and drops) fields the model invented.
 - **Autonomous vendor-discrepancy detection.** The Validation Agent cross-references each candidate against `master_data/` and the `erp.py` oracle, flagging unmatched vendor IDs, fabricated master codes, line-arithmetic drift and gross recompute mismatches — before they reach the ERP.
+- **Deterministic ERP guardrails.** Beyond the recompute oracle, the validator hard-blocks the two classic double-counting mistakes that silently inflate a booking: category-header/subtotal rows (`_check_header_rows`) and taxes booked both as a `TAX` line *and* in header `taxes[]` (`_check_tax_duplication`) — both raised as **ERROR** so the corrector must resolve them before converging.
 - **Bounded autonomy, zero risk of runaway loops.** The correction loop is hard-capped at `INV_MAX_RETRIES` (default **3**) — the system can improve a record, but it can never loop forever.
 - **Every number grounded in the document.** The pipeline never invents a value to "make the total work"; the ERP derives totals from the raw components supplied, so what you see is what was printed.
 
@@ -72,18 +73,62 @@ The vision: an accounts-payable team approves exceptions instead of keying docum
   - every set master code exists in its master file (ERROR otherwise);
   - an unmatched vendor ID / supplier string is flagged;
   - the ERP recompute of the raw components is compared to the printed `gross_total` (amount inconsistency = ERROR);
-  - line qty×price vs printed extension and PO references are advisory hints.
-- **Corrector agent** — an LLM handed the proposed JSON *plus* the validation issues *plus* the raw document text; it repairs only flagged fields, never invents values.
+  - line qty×price vs printed extension and PO references are advisory hints;
+  - `_check_header_rows` raises **ERROR** for category-header / subtotal-summary rows (e.g. "PECO ELECTRIC DELIVERY", "TAXES & FEES"): they repeat a section name and carry the section's *aggregate* amount, so keeping them double-counts the ERP's qty×price book;
+  - `_check_tax_duplication` raises **ERROR** when the same tax is booked both as a `TAX` line item and in header `taxes[]` — the ERP adds both, inflating gross.
+- **Corrector agent** — an LLM handed the proposed JSON *plus* the validation issues *plus* the raw document text; it repairs only flagged fields, never invents values. If a correction inference itself fails (timeout, malformed reply, schema rejection) the failure is contained as `CorrectorFailure`: the flawed **proposal is kept** and the loop stops — the document is never lost and a broken corrector cannot burn the retry budget.
 - **The loop** iterates propose → validate → correct until no ERROR-grade issues remain or `max_retries` (default 3) is hit — **guaranteed termination**.
 
 ### Why open-weight models via Groq
 
-All agent LLMs run against an **OpenAI-compatible endpoint driven by `OPENAI_API_KEY` / `OPENAI_BASE_URL`**, configured to target **`llama-3.3-70b-versatile`** (open-weight, Llama 3.3 70B, served via Groq). Rationale:
+All agent LLMs run against an **OpenAI-compatible endpoint driven by `OPENAI_API_KEY` / `OPENAI_BASE_URL`**, with **two-tier model routing**:
+- **Vision** (image-only/scan pages) → **`qwen/qwen3.8-27b`** (multimodal; required because it accepts `image_url`/base64 payloads),
+- **Text** (structuring, validation, correction) → **`openai/gpt-oss-120b`** (text-only).
 
-- **Speed.** Groq's LPU inference serves Llama 3.3 70B at hundreds of tokens/second — a full document runs in seconds, not minutes.
+Rationale:
+
+- **Speed.** Groq's LPU inference serves GPT-OSS 120B at hundreds of tokens/second — a full document runs in seconds, not minutes.
 - **Cost & sovereignty.** Open-weight models run cheaply and can be self-hosted; there is no per-token price lock-in or data-residency constraint inherent to closed APIs.
 - **Accuracy where it matters.** Validation is deterministic (master-data cross-reference + ERP oracle), so the *entire* loop converges exactly — the LLM is only the extraction/correction actor, not the source of truth.
-- **Portability.** The provider is swappable: changing `OPENAI_BASE_URL` + `INV_STRUCTURING_MODEL` re-points the whole pipeline without code changes.
+- **Portability.** The provider is swappable: changing `OPENAI_BASE_URL` + `INV_VISION_MODEL`/`INV_STRUCTURING_MODEL` re-points the whole pipeline without code changes.
+
+---
+
+## Production Hardening & Fault Tolerance
+
+Everything below is engineered so a large batch run survives real-world providers
+and operators — rate limits, timeouts, partial disk writes, and UI hangs included.
+
+1. **Persistent MD5 transcription cache (`.cache/transcriptions/`).** Every
+   rasterised page's transcription is written to disk under a **content-fingerprinted**
+   key — an MD5 of the rendered PNG's *bytes* (document + page + image digest), so two
+   different pages can never collide even at identical byte lengths. Writes are
+   **atomic** (`.tmp` file + `os.replace`), so a hard exit can never leave a
+   half-written entry; empty or corrupted cache files are treated as misses and
+   re-transcribed (`src/extractor.py`).
+
+2. **Rate-limit & transient-error resilience (`src/llm_retry.py`).** Every provider
+   call rides an 8-level cause-chain walk that classifies retryable failures across the
+   OpenAI SDK *and* raw HTTPX: 429 (honouring a numeric `Retry-After` header verbatim,
+   capped at 300 s), Groq **TPM** 413 `rate_limit_exceeded` (fixed 60 s window wait),
+   5xx / 408 / 409 / 425, timeouts, and connection resets — then retries with
+   exponential back-off + jitter (capped at 60 s) up to `max_attempts` (default 10).
+   A per-document TPM/RPM budget never stalls the batch: one bad file degrades to an
+   honest `declined` entry and processing continues.
+
+3. **Zero-token text-layer routing (`src/pipeline.py` & `src/extractor.py`).** Pages
+   whose embedded text layer is usable are returned verbatim and **never** contact the
+   vision API. The multimodal model is strictly isolated to image-only pages
+   (`text_layer_min_chars`, default 80), and consecutive vision calls are paced by a
+   configurable `INV_VISION_PACING_DELAY` (default 2.0 s) to keep Groq TPM/RPM flat
+   on multi-page scans. Text-layer re-runs cost **zero** vision tokens.
+
+4. **Thread-safe Streamlit architecture (`app.py`).** The dashboard never blocks on a
+   long run: "Run Pipeline" executes on a daemon background thread with a done-flag
+   polling loop (the page auto-refreshes, the button is disabled meanwhile). PDF
+   rasterisation is memoised with `@st.cache_data` keyed on file content + DPI, errors
+   are surfaced in a collapsible expander, and per-PDF results are isolated in session
+   state so switching documents never shows stale data.
 
 ---
 
@@ -111,9 +156,10 @@ cp .env.example .env
 #   OPENAI_BASE_URL=https://api.groq.com/openai/v1
 ```
 
-Defaults target **`llama-3.3-70b-versatile`** on Groq as the extraction and structuring model. If your Groq account exposes a different id, override per-run or in `.env`:
+Defaults target **`qwen/qwen3.8-27b`** (multimodal vision) on Groq for image/scan transcription and **`openai/gpt-oss-120b`** for structuring. If your gateway exposes different ids — and keep the vision model *multimodal* — override per-run or in `.env`:
 
 ```bash
+export INV_VISION_MODEL=qwen/qwen3.8-27b
 export INV_STRUCTURING_MODEL=openai/gpt-oss-120b
 ```
 
@@ -154,16 +200,40 @@ python check_outputs.py            # or: python check_outputs.py output/INV-31.j
 ### 6. Test & lint
 
 ```bash
-python -m pytest tests -q          # 70+ tests, no API key required
-python -m ruff check src tests run.py erp.py example_check.py check_outputs.py
+python -m pytest tests -q          # 104+ tests, no API key required
+python -m ruff check src tests run.py erp.py example_check.py check_outputs.py app.py
 ```
 
----
+### 7. Streamlit dashboard
+
+An interactive UI for reviewing a single invoice end-to-end: rendered PDF pages
+beside a live ERP-oracle audit of the extracted output.
+
+```bash
+streamlit run app.py
+```
+
+Layout:
+
+- **Left panel** — the selected PDF's pages rendered side-by-side via PyMuPDF.
+- **Right panel** — a control strip plus three interactive tabs:
+  - **ERP Oracle Audit** — feeds the extracted JSON through `erp.erp_book()` and
+    compares the printed gross to the recomputed gross, shown as MATCH/MISMATCH
+    metric badges.
+  - **Extracted JSON** — the structured output formatted per `AUTODRAFT_SCHEMA.md`.
+  - **Line Items** — an interactive table of extracted descriptions, quantities,
+    unit prices, totals, and tax lines.
+- **Sidebar** — pick which PDF from `documents/`, toggle multi-agent validation
+  (`--validate`), and press **Run Pipeline** to (re)extract and (re)validate.
+
+If a matching `output/<file>.json` already exists it is loaded for auditing
+without re-running the pipeline; clicking **Run Pipeline** regenerates it.
 
 ## Repository layout
 
 | Path | Purpose |
 |---|---|
+| `app.py` | Streamlit dashboard: PDF viewer + ERP oracle audit + JSON/line-item tabs |
 | `run.py` | One-command runner (`--validate` enables the agent loop) |
 | `check_outputs.py` | ERP bridge: validated outputs → `erp_book` → MATCH/MISMATCH |
 | `src/pdf_reader.py` | PDF ingest, text/image detection, rasterisation |
@@ -173,8 +243,9 @@ python -m ruff check src tests run.py erp.py example_check.py check_outputs.py
 | `src/formatter.py` | LLM structuring chain + provider-agnostic JSON parser |
 | `src/validation.py` | Deterministic Validation Agent (master + ERP oracle) |
 | `src/agents.py` | Validation loop: proposer/validator/corrector, ≤`max_retries` |
+| `src/llm_retry.py` | Retry/back-off wrapper: 429 + TPM + transient-error handling |
 | `src/pipeline.py` | Per-file orchestration and `output/` writing |
-| `tests/` | 70+ unit + integration tests (schema, matching, loop, ERP bridge) |
+| `tests/` | 104+ unit + integration tests (schema, matching, loop, ERP bridge, retries) |
 | `erp.py` | The ERP recompute oracle (fixed; graded as-is) |
 
 The original challenge brief is preserved in [`CHALLENGE_BRIEF.md`](CHALLENGE_BRIEF.md).

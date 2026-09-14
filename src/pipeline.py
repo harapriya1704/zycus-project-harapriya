@@ -21,6 +21,7 @@ from src.agents import ValidationLoop
 from src.config import Settings, get_settings
 from src.extractor import extract_document_text
 from src.formatter import format_autodraft
+from src.llm_retry import describe_error
 from src.logging_conf import get_logger
 from src.master_data import MasterData
 from src.pdf_reader import read_pdf
@@ -70,10 +71,15 @@ def process_document(
             min_text_chars=cfg.text_layer_min_chars,
             dpi=cfg.pdf_render_dpi,
         )
+        # Vision routing: the vision model (qwen/qwen3.8-27b) is invoked ONLY
+        # for pages rasterised as images (embedded text layer shorter than
+        # ``text_layer_min_chars`` ==> 0 usable chars). Text-layer pages are
+        # returned verbatim by ``extract_document_text`` and never reach the
+        # vision API, so scanning a text-layer PDF costs zero vision tokens.
         extract_document_text(document, chain=vision_chain, settings=cfg)
         document_text = document.text()
     except Exception as exc:  # noqa: BLE001 - degrade to argued 'declined'
-        log.error("%s: extraction failed (%s)", pdf_path.name, exc)
+        log.error("%s: extraction failed: %s", pdf_path.name, describe_error(exc))
         return _decline(exc, pdf_path.name)
 
     try:
@@ -88,7 +94,7 @@ def process_document(
                 settings=cfg,
             )
     except Exception as exc:  # noqa: BLE001 - e.g. no credentials for text pages
-        log.error("%s: structuring failed (%s)", pdf_path.name, exc)
+        log.error("%s: structuring failed: %s", pdf_path.name, describe_error(exc))
         return _decline(exc, pdf_path.name)
 
     log.info(
@@ -156,15 +162,29 @@ def process_directory(
     payable_count = 0
     declined_reasons: Counter = Counter()
     for pdf in pdfs:
-        result = process_document(
-            pdf,
-            settings=cfg,
-            vision_chain=vision_chain,
-            structuring_chain=structuring_chain,
-            master=master_effective,
-            validation_loop=validation_loop,
-        )
-        write_output(result, output_dir)
+        try:
+            result = process_document(
+                pdf,
+                settings=cfg,
+                vision_chain=vision_chain,
+                structuring_chain=structuring_chain,
+                master=master_effective,
+                validation_loop=validation_loop,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad file must not kill the batch
+            # Unrecoverable per-document failure (e.g. an API error that survives
+            # every retry): degrade to an honest 'declined' entry, log it, and let
+            # the batch continue with the remaining PDFs.
+            log.error(
+                "%s: unhandled processing error, marking declined and continuing: %s",
+                pdf.name,
+                describe_error(exc),
+            )
+            result = _decline(exc, pdf.name)
+        try:
+            write_output(result, output_dir)
+        except Exception as exc:  # noqa: BLE001 - a disk failure must not kill the batch
+            log.error("%s: output write failed (%s); continuing", pdf.name, describe_error(exc))
         payable_count += len(result.payables)
         for entry in result.declined:
             declined_reasons[entry.doc_type if entry.doc_type else "DECLINED"] += 1

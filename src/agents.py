@@ -16,7 +16,7 @@ default **3**) so it terminates in finite time whatever the model does; the
 last produced autodraft (and its remaining issues) is always returned.
 
 All LLM agents target the same OpenAI-compatible provider configured in
-``.env`` (Groq: ``llama-3.3-70b-versatile``) via :class:`src.config.Settings`.
+``.env`` (default: ``openai/gpt-oss-120b``) via :class:`src.config.Settings`.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from langchain_openai import ChatOpenAI
 
 from src.config import Settings, get_settings
 from src.formatter import _ask, _finalize, format_autodraft, resolve_codes
+from src.llm_retry import describe_error
 from src.logging_conf import get_logger
 from src.master_data import MasterData
 from src.schemas import Autodraft, FileOutput
@@ -52,6 +53,16 @@ of the flagged inconsistencies as possible. Rules:
 - Only change a field when an issue requires it. Leave correct fields untouched.
 - Reproduce values EXACTLY as printed on the document; never invent numbers.
 - Numbers are strings in dot-decimal form ("1234.56").
+- Non-tax line items must carry explicit 'quantity' and 'unit_price'; the ERP
+  prices a line as quantity x unit_price, so an empty price books it as ZERO.
+  Line items must have explicit quantity and unit_price. If missing, set
+  quantity = '1' and unit_price equal to the line total.
+- Remove category headers and subtotal summary rows that are NOT atomic
+  charges — e.g. "Electric", "PECO ELECTRIC DELIVERY", "ELECTRIC SUPPLY",
+  "TAXES & FEES", "Total New Charges", "Total Current Charges". Keep every
+  atomic line charge (a single quantity x rate or a single flat fee).
+- Keep tax lines (item_type "TAX") carrying their value in total/tax_amount,
+  with quantity and unit_price left "".
 - Master-data codes (supplier_id, buyer codes, payment_term_id, po_id,
   tax_type_code) stay empty unless you are fixing an explicitly flagged,
   verifiable mismatch. Do not guess codes.
@@ -69,6 +80,16 @@ class ValidationResult:
     attempts: int = 0  # corrections actually issued
     converged: bool = False  # True when the final proposal is error-free
     max_retries: int = 3
+
+
+class CorrectorFailure(RuntimeError):
+    """The corrector LLM could not produce a valid revised autodraft.
+
+    Raised internally when a correction inference fails (timeout, malformed
+    reply, schema rejection). The proposal for that payable is kept instead of
+    killing the document, and further correction iterations are skipped because
+    the same broken corrector would only waste the retry budget.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +126,7 @@ def build_corrector_chain(
             base_url=cfg.provider_base_url(),
             api_key=cfg.provider_api_key(),
             max_tokens=cfg.llm_max_tokens,
+            timeout=cfg.llm_timeout,
         )
     except Exception as exc:  # typically a missing OPENAI_API_KEY
         log.error("ChatOpenAI (corrector) construction failed: %s (%s)", type(exc).__name__, exc)
@@ -167,6 +189,9 @@ class ValidationLoop:
         self.corrector_chain = corrector_chain
         self.validator = MasterDataValidator(master)
         self.stats: dict[str, int] = {"converged": 0, "not_converged": 0, "corrections": 0}
+        # Set when a correction inference fails; stops further iterations so a
+        # broken corrector cannot burn the whole retry budget pointlessly.
+        self._corrector_failed = False
 
     # ------------------------------------------------------------------
     def run(self, document_text: str, filename: str) -> ValidationResult:
@@ -184,7 +209,11 @@ class ValidationLoop:
         issues = self.validator.validate(file_output, document_text=document_text)
 
         attempts = 0
-        while self._has_errors(issues) and attempts < self.max_retries:
+        while (
+            self._has_errors(issues)
+            and attempts < self.max_retries
+            and not self._corrector_failed
+        ):
             file_output = self._correct(file_output, issues, document_text, filename)
             issues = self.validator.validate(file_output, document_text=document_text)
             attempts += 1
@@ -233,7 +262,20 @@ class ValidationLoop:
             if not payable_issues:
                 corrected_payables.append(payable)
                 continue
-            corrected = self._correct_one(payable, payable_issues, document_text)
+            try:
+                corrected = self._correct_one(payable, payable_issues, document_text)
+            except CorrectorFailure:
+                # Keep the (imperfect) proposal rather than losing the document;
+                # the loop stops here because re-running a broken corrector is
+                # guaranteed to fail again.
+                log.warning(
+                    "Corrector failed for payable %s; keeping the proposal and "
+                    "stopping correction iterations.",
+                    payable.invoice_number or idx,
+                )
+                self._corrector_failed = True
+                corrected_payables.append(payable)
+                continue
             corrected_payables.append(corrected)
 
         if not corrected_payables:
@@ -256,13 +298,21 @@ class ValidationLoop:
         from src.validation import MasterDataValidator
 
         issue_payload = MasterDataValidator.format_issues(issues)
-        return chain.invoke(
-            {
-                "proposed_json": payable.model_dump_json(),
-                "issues_json": issue_payload,
-                "document_text": document_text,
-            }
-        )
+        try:
+            return chain.invoke(
+                {
+                    "proposed_json": payable.model_dump_json(),
+                    "issues_json": issue_payload,
+                    "document_text": document_text,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - wrapped below, not re-raised raw
+            log.error(
+                "Corrector inference failed for payable %s: %s",
+                payable.invoice_number or "?",
+                describe_error(exc),
+            )
+            raise CorrectorFailure(str(exc)) from exc
 
     # ------------------------------------------------------------------
     @staticmethod

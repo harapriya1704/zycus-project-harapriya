@@ -151,3 +151,31 @@ def test_declined_documents_never_enter_corrector() -> None:
     assert result.file_output.payables == []
     assert len(result.file_output.declined) == 1
     assert calls == []
+
+
+def test_corrector_failure_keeps_proposal_and_stops_iterations() -> None:
+    """A corrector that throws must not lose the document nor burn retries."""
+    master = MasterData.load(MASTER_DIR)
+
+    def _bad_proposer(_inputs: dict) -> FileOutput:
+        return FileOutput(
+            file="INV-99.pdf",
+            payables=[Autodraft(invoice_number="1", currency="EUR", gross_total="999.00")],
+        )
+
+    def _exploding_corrector(_inputs: dict) -> Autodraft:
+        raise RuntimeError("provider 500 after every retry")
+
+    loop = ValidationLoop(
+        master=master,
+        max_retries=3,
+        structuring_chain=RunnableLambda(_bad_proposer),
+        corrector_chain=RunnableLambda(_exploding_corrector),
+    )
+    result = loop.run(_DOC_TEXT, "INV-99.pdf")
+    # The proposal is kept (document is not lost), and only ONE correction
+    # attempt is made — the loop sees the broken corrector and stops.
+    assert result.file_output.payables[0].gross_total == "999.00"
+    assert result.attempts == 1
+    assert result.converged is False
+    assert loop.stats["corrections"] == 1

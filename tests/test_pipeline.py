@@ -56,6 +56,21 @@ def test_process_document_text_layer_end_to_end(tmp_path: Path) -> None:
     assert result.payables[0].supplier.supplier_id == "2845695"
 
 
+def test_text_layer_pdf_never_invokes_vision_routing(tmp_path: Path) -> None:
+    """Vision routing: qwen is NOT called when the PDF has a usable text layer."""
+    text = "A readable supplier invoice with a substantial embedded text layer, no rasterisation needed, repeated to clear the threshold. " * 3
+    pdf = _text_pdf(tmp_path / "inv.pdf", text)
+    master = MasterData.load(Path(__file__).resolve().parent.parent / "master_data")
+
+    vision_calls: list[int] = []
+    fake_vision = RunnableLambda(lambda page: vision_calls.append(page.index) or "never")
+    fake_struct = RunnableLambda(lambda _: _sample_output())
+
+    result = process_document(pdf, structuring_chain=fake_struct, master=master, vision_chain=fake_vision)
+    assert len(result.payables) == 1
+    assert vision_calls == []  # text layer extracted, zero vision tokens spent
+
+
 def test_process_document_failed_extraction_declines(tmp_path: Path) -> None:
     missing = tmp_path / "does-not-exist.pdf"
     result = process_document(missing)
@@ -80,3 +95,29 @@ def test_process_directory_writes_every_pdf(tmp_path: Path) -> None:
     assert (out / "a.json").is_file()
     assert (out / "b.json").is_file()
     assert json.loads((out / "a.json").read_text(encoding="utf-8"))["file"] == "a.pdf"
+
+
+def test_process_directory_continues_after_crash(tmp_path: Path, monkeypatch) -> None:
+    """A document whose handling raises must not abort the whole batch."""
+    filler = "Amount of embedded text used by the pipeline test fixture to stay above the image threshold. " * 3
+    _text_pdf(tmp_path / "a.pdf", filler + "A")
+    _text_pdf(tmp_path / "b.pdf", filler + "B")
+
+    def _flakey(pdf_path, **_kwargs) -> FileOutput:
+        if pdf_path.name == "a.pdf":
+            raise RuntimeError("rate limit survived every retry")
+        out = _sample_output()
+        out.file = pdf_path.name  # real structuring set the ``file`` to the PDF name
+        return out
+
+    monkeypatch.setattr("src.pipeline.process_document", _flakey)
+    out = tmp_path / "out"
+    summary = process_directory(tmp_path, out)
+
+    assert summary["files_processed"] == 2
+    assert summary["payables"] == 1  # the healthy document still booked
+    assert (out / "a.json").is_file()  # crash degraded to an honest declined file
+    assert (out / "b.json").is_file()
+    declined = json.loads((out / "a.json").read_text(encoding="utf-8"))
+    assert declined["payables"] == []
+    assert declined["declined"][0]["doc_type"] == "ERROR"

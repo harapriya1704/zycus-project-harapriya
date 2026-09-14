@@ -18,14 +18,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 from src.agents import ValidationLoop
 from src.config import get_settings
-from src.logging_conf import configure_logging
+from src.logging_conf import configure_logging, get_logger
 from src.master_data import MasterData
-from src.pipeline import process_directory
+from src.pipeline import process_directory, process_document, write_output
 
+log = get_logger(__name__)
 logger_ready = False
 
 
@@ -44,6 +46,7 @@ def _cli(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--input-dir", type=Path, default=None, help="Folder of PDFs (default: <repo>/documents)")
     parser.add_argument("--output-dir", type=Path, default=None, help="Output folder (default: <repo>/output)")
+    parser.add_argument("--file", type=Path, default=None, help="Process a single PDF instead of an input folder")
     parser.add_argument("--log-level", default=None, help="Log level (default: INV_LOG_LEVEL or INFO)")
     parser.add_argument("--validate", action="store_true",
                         help="Route documents through the multi-agent validation loop")
@@ -64,7 +67,30 @@ def _cli(argv: list[str] | None = None) -> int:
     if args.validate:
         loop = ValidationLoop(master=MasterData.load_default(settings=cfg), settings=cfg)
 
-    summary = process_directory(documents_dir, output_dir, validation_loop=loop)
+    if args.file is not None:
+        pdf = args.file.resolve()
+        if not pdf.is_file():
+            log.error("File not found: %s", pdf)
+            return 1
+        master = MasterData.load_default(settings=cfg)
+        result = process_document(
+            pdf,
+            settings=cfg,
+            master=master,
+            validation_loop=loop,
+        )
+        write_output(result, output_dir)
+        declined_reasons: Counter = Counter()
+        for entry in result.declined:
+            declined_reasons[entry.doc_type if entry.doc_type else "DECLINED"] += 1
+        summary = {
+            "file": result.file,
+            "files_processed": 1,
+            "payables": len(result.payables),
+            "declined": declined_reasons,
+        }
+    else:
+        summary = process_directory(documents_dir, output_dir, validation_loop=loop)
     if loop is not None:
         summary["validation"] = loop.stats
     print(json.dumps(summary, ensure_ascii=False, indent=2))
