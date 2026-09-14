@@ -103,10 +103,30 @@ HARD RULES:
   invoice. Pages that are not payables must not create payables."""
 
 
+#: Streamlined system prompt for fast testing mode (``--fast``). Same hard
+#: rules, but the verbose markdown walk-through and examples are dropped —
+#: roughly half the input tokens of :data:`_STRUCTURING_SYSTEM_PROMPT`.
+_STRUCTURING_SYSTEM_PROMPT_FAST = """You structure ONE supplier document's text into ERP autodraft JSON:
+{"payables":[ ... ],"declined":[{"doc_type":"...","reason":"..."}]}
+
+A payable (INVOICE or CREDIT_MEMO) has: invoice_number, invoice_date (ISO YYYY-MM-DD), due_date, currency, supplier{name, supplier_id:"", address, vat_id}, buyer{company_code:"", business_unit_code:"", location_code:""}, payment_term_id:"", po_number, po_id:"", gross_total, subtotal, total_tax_amount, discount_amount, freight_charges, insurance_charges, extra_charges, excise_duties, taxes[{tax_type, tax_name, tax_rate, tax_amount, tax_type_code:""}], line_items[{description,item_type,uom,quantity,unit_price,total,discount,discount_percentage,tax_rate,tax_amount,taxes[...]}].
+
+HARD RULES:
+- Reproduce values EXACTLY as printed; never compute totals the document does not print; a field not printed is "".
+- Numbers are strings in dot-decimal form; convert European comma decimals ("1.234,56" -> "1234.56").
+- quantity and unit_price are MANDATORY on non-tax lines; a flat-fee line uses quantity "1" and unit_price = line total.
+- EXCLUDE category headers and subtotal/grand-total summaries from line_items (e.g. "Total New Charges", "TAXES & FEES"); keep only atomic charges.
+- item_type is GOODS|SERVICE|FREIGHT|TAX. A TAX line carries total/tax_amount with empty quantity and unit_price.
+- NEVER fill master-data codes: supplier_id, buyer codes, payment_term_id, po_id, tax_type_code stay "".
+- Not a payable (statement, duplicate, advert, letter) -> payables:[] and a declined[] entry with real doc_type/reason.
+- A PDF may hold several payables. Return ONLY the JSON, no preamble."""
+
+
 def build_autodraft_chain(
     model: str | None = None,
     temperature: float | None = None,
     settings: Settings | None = None,
+    fast_mode: bool = False,
 ) -> Runnable:
     """Build the LangChain runnable: document text -> :class:`FileOutput`.
 
@@ -118,6 +138,8 @@ def build_autodraft_chain(
         model: chat model name; defaults to ``INV_STRUCTURING_MODEL``.
         temperature: sampling temperature; defaults to the configured value.
         settings: settings source; defaults to the process singleton.
+        fast_mode: use the streamlined fast-mode system prompt (half the
+            input tokens, same hard rules).
 
     Returns:
         A ``Runnable`` accepting ``{"document_text": str}`` and returning a
@@ -136,7 +158,7 @@ def build_autodraft_chain(
             temperature=temp,
             base_url=cfg.provider_base_url(),
             api_key=cfg.provider_api_key(),
-            max_tokens=cfg.llm_max_tokens,
+            max_tokens=cfg.effective_max_tokens(),
             timeout=cfg.llm_timeout,
         )
     except Exception as exc:  # typically a missing OPENAI_API_KEY
@@ -148,10 +170,12 @@ def build_autodraft_chain(
 
     # The system prompt is passed as a *fixed* SystemMessage (not a template):
     # it contains literal ``{``/``}`` for the JSON examples, which must not be
-    # treated as f-string replacement fields.
+    # treated as f-string replacement fields. Fast mode swaps in the compact
+    # variant (identical rules, far fewer input tokens).
+    system_prompt = _STRUCTURING_SYSTEM_PROMPT_FAST if fast_mode else _STRUCTURING_SYSTEM_PROMPT
     prompt = ChatPromptTemplate.from_messages(
         [
-            SystemMessage(content=_STRUCTURING_SYSTEM_PROMPT),
+            SystemMessage(content=system_prompt),
             ("human", "Document text:\n\n{document_text}"),
         ]
     )
@@ -278,16 +302,24 @@ def _finalize(schema: type[pydantic.BaseModel]) -> Runnable:
     return RunnableLambda(_parse, name=f"{schema.__name__}_parser")
 
 
-@lru_cache(maxsize=4)
-def _chain_for(model: str, temperature: float) -> Runnable:
-    """Cached structuring chain per (model, temperature)."""
-    return build_autodraft_chain(model=model, temperature=temperature)
+@lru_cache(maxsize=8)
+def _chain_for(model: str, temperature: float, fast_mode: bool) -> Runnable:
+    """Cached structuring chain per (model, temperature, fast mode)."""
+    return build_autodraft_chain(
+        model=model, temperature=temperature, fast_mode=fast_mode
+    )
 
 
 def _structuring_chain(settings: Settings | None = None) -> Runnable:
-    """Resolve the structuring chain for the given settings."""
+    """Resolve the structuring chain for the given settings.
+
+    Fast mode selects the lightweight model and the compact prompt; precision
+    mode uses the configured heavy model and the full system prompt.
+    """
     cfg = settings or get_settings()
-    return _chain_for(cfg.structuring_model, cfg.structuring_temperature)
+    return _chain_for(
+        cfg.effective_structuring_model(), cfg.structuring_temperature, cfg.fast_mode
+    )
 
 
 def resolve_codes(
@@ -391,8 +423,19 @@ def format_autodraft(
         return result
 
     effective_chain = chain or _structuring_chain(cfg)
-    log.info("%s: structuring %s chars of text", filename, len(document_text))
-    result: FileOutput = effective_chain.invoke({"document_text": document_text})
+
+    # Token budget in fast mode: only the first ``fast_max_input_chars`` chars
+    # reach the LLM. Deterministic code resolution still sees the full text, so
+    # master matching is unaffected.
+    cap = cfg.effective_max_input_chars()
+    text_for_llm = document_text if cap <= 0 else document_text[:cap]
+    log.info(
+        "%s: structuring %s chars of text (budget %s)",
+        filename,
+        len(text_for_llm),
+        cap or "unlimited",
+    )
+    result: FileOutput = effective_chain.invoke({"document_text": text_for_llm})
     result.file = filename
 
     effective_master = master if master is not None else MasterData.load_default(settings=cfg)

@@ -11,6 +11,12 @@ pydantic-settings>=2.3.0
 pymupdf>=1.24.0
 pypdf>=5.0.0
 
+# ── Local OCR fallback (fast mode) ────────────────────────────────
+# pytesseract + Pillow enable CPU-based OCR for scanned pages so the
+# Vision LLM API is bypassed entirely in fast mode.
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
 # ── Runtime / env ─────────────────────────────────────────────────
 python-dotenv>=1.0.0
 tiktoken>=0.7.0

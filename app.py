@@ -93,14 +93,17 @@ def _resolve_output_dir() -> Path:
     return get_settings().resolved_output_dir()
 
 
-def _run_pipeline(pdf_path: Path, validate: bool) -> dict:
+def _run_pipeline(pdf_path: Path, validate: bool, fast: bool) -> dict:
     """Run the extract-structure-(validate) pipeline for one PDF and persist it."""
     from src.agents import ValidationLoop
     from src.config import get_settings
     from src.master_data import MasterData
     from src.pipeline import process_document, write_output
 
-    cfg = get_settings()
+    base_cfg = get_settings()
+    # Fast Testing Mode is a per-run flag: copy the singleton settings and flip
+    # just the switch (threshold, pacing, retries and model routing follow it).
+    cfg = base_cfg.model_copy(update={"fast_mode": fast})
     master = MasterData.load_default(settings=cfg)
     loop = ValidationLoop(master=master, settings=cfg) if validate else None
     result = process_document(pdf_path, settings=cfg, master=master, validation_loop=loop)
@@ -141,7 +144,7 @@ def _audit_payable(payable: dict) -> None:
     )
 
 
-def _launch_pipeline(pdf_path: Path, validate: bool) -> None:
+def _launch_pipeline(pdf_path: Path, validate: bool, fast: bool) -> None:
     """Run the pipeline for one PDF off the UI thread.
 
     The browser stays responsive while Groq rate-limit back-off retries; the
@@ -150,7 +153,7 @@ def _launch_pipeline(pdf_path: Path, validate: bool) -> None:
 
     def _work() -> None:
         try:
-            st.session_state["pipeline_result"] = _run_pipeline(pdf_path, validate)
+            st.session_state["pipeline_result"] = _run_pipeline(pdf_path, validate, fast)
             st.session_state["pipeline_error"] = None
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI, never kill the thread
             from src.llm_retry import describe_error
@@ -252,6 +255,16 @@ def _main() -> None:
         selected = st.selectbox("PDF file", names, index=0)
         pdf_path = _documents_dir() / selected
         validate = st.checkbox("Multi-agent validation (--validate)", value=True)
+        fast = st.checkbox(
+            "Fast testing mode (--fast)",
+            value=False,
+            help="Skip the vision LLM for text pages, cap retries to 0, use a lightweight structuring model.",
+        )
+        if fast:
+            st.info(
+                "⚠️ [FAST TESTING MODE ACTIVE] Bypassing Vision API | "
+                "Retries capped to 0 | Input text truncated."
+            )
         running = st.session_state["pipeline_running"]
 
         if running:
@@ -260,7 +273,7 @@ def _main() -> None:
         elif st.button("Run Pipeline", type="primary"):
             st.session_state["results"].pop(pdf_path.stem, None)  # never show stale data
             st.session_state["last_error"] = None
-            _launch_pipeline(pdf_path, validate)
+            _launch_pipeline(pdf_path, validate, fast)
 
     if st.session_state["pipeline_running"]:
         if st.session_state["pipeline_done"]:

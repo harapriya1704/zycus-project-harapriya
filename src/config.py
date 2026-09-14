@@ -96,8 +96,82 @@ class Settings(BaseSettings):
     #: loop hard-stops here to guarantee it cannot run forever.
     max_retries: int = Field(default=3, ge=1, le=20)
 
+    # ── Fast testing mode (--fast) ───────────────────────────────────────
+    #: Master switch for fast local testing: skips the vision LLM for every
+    #: page with a usable text layer, disables inter-call pacing, caps the
+    #: multi-agent loop to a single pass and routes structuring to a fast,
+    #: lightweight model. Accepted trade-off: slightly lower extraction
+    #: precision on text-heavy pages.
+    fast_mode: bool = Field(default=False)
+    #: In fast mode, pages whose embedded text layer carries at least this
+    #: many printable characters are reused verbatim — never rasterised to a
+    #: PNG, never sent to the vision model (the "> 50 chars" rule).
+    fast_text_layer_min_chars: int = Field(default=50, ge=1)
+    #: Lightweight structuring model for fast mode (text-only; no images).
+    fast_structuring_model: str = Field(default="llama-3.1-8b-instant")
+    #: Correction iterations allowed in fast mode. ``0`` = single-pass
+    #: extraction: propose + validate, no LLM Corrector iterations.
+    fast_max_retries: int = Field(default=0, ge=0, le=20)
+    #: Cap (chars) on the raw page text sent to the structuring LLM in fast
+    #: mode. ``0`` disables the cap (normal precision mode passes everything).
+    fast_max_input_chars: int = Field(default=3000, ge=0)
+    #: Hard-cap on output tokens for structuring LLM calls in fast mode.
+    #: Prevents model rambling and keeps latency/usage minimal.
+    fast_max_tokens: int = Field(default=1000, ge=256, le=1_000_000)
+
     # ── Logging ─────────────────────────────────────────────────────────
     log_level: str = Field(default="INFO")
+
+    # ------------------------------------------------------------------
+    def effective_text_layer_min_chars(self) -> int:
+        """Text-layer threshold used by the reader.
+
+        Fast mode lowers it to ``fast_text_layer_min_chars`` (50) so pages
+        carrying "more than 50 characters" of text skip rasterisation and the
+        vision LLM entirely.
+        """
+        return self.fast_text_layer_min_chars if self.fast_mode else self.text_layer_min_chars
+
+    def effective_structuring_model(self) -> str:
+        """Structuring model used by the proposer/corrector chains.
+
+        Fast mode swaps the heavy model for ``fast_structuring_model``
+        (e.g. ``llama-3.1-8b-instant`` on Groq).
+        """
+        return self.fast_structuring_model if self.fast_mode else self.structuring_model
+
+    def effective_vision_pacing_delay(self) -> float:
+        """Seconds to sleep between consecutive vision calls (0.0 = disabled).
+
+        Fast mode always disables pacing — local runs want speed, not flat
+        provider TPM/RPM.
+        """
+        return 0.0 if self.fast_mode else self.vision_pacing_delay
+
+    def effective_max_retries(self) -> int:
+        """Correction iterations allowed by the validation loop.
+
+        Fast mode forces ``0`` (single-pass): the Corrector Agent is never run
+        and only deterministic post-processing resolves the draft.
+        """
+        return self.fast_max_retries if self.fast_mode else self.max_retries
+
+    def effective_max_input_chars(self) -> int:
+        """Cap on the input text sent to the structuring LLM (0 = unlimited).
+
+        Fast mode truncates the raw page text to ``fast_max_input_chars``
+        (default 3000 chars per page) so prompt tokens drop sharply on long
+        documents.
+        """
+        return self.fast_max_input_chars if self.fast_mode else 0
+
+    def effective_max_tokens(self) -> int:
+        """Output token budget for one structuring/correction LLM call.
+
+        Fast mode hard-caps completion tokens to ``fast_max_tokens`` (default
+        1000) to prevent model rambling and minimise latency.
+        """
+        return self.fast_max_tokens if self.fast_mode else self.llm_max_tokens
 
     # ------------------------------------------------------------------
     def provider_base_url(self) -> str:

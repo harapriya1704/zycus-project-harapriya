@@ -125,7 +125,7 @@ def build_corrector_chain(
             temperature=temp,
             base_url=cfg.provider_base_url(),
             api_key=cfg.provider_api_key(),
-            max_tokens=cfg.llm_max_tokens,
+            max_tokens=cfg.effective_max_tokens(),
             timeout=cfg.llm_timeout,
         )
     except Exception as exc:  # typically a missing OPENAI_API_KEY
@@ -184,7 +184,11 @@ class ValidationLoop:
         cfg = settings or get_settings()
         self.settings = cfg
         self.master = master
-        self.max_retries = max_retries if max_retries is not None else cfg.max_retries
+        # Default retry budget honours fast mode (single-pass, 0 retries) unless
+        # an explicit value is passed in; it can never exceed the hard cap.
+        self.max_retries = (
+            max_retries if max_retries is not None else cfg.effective_max_retries()
+        )
         self.structuring_chain = structuring_chain
         self.corrector_chain = corrector_chain
         self.validator = MasterDataValidator(master)
@@ -292,7 +296,8 @@ class ValidationLoop:
     ) -> Autodraft:
         """Run one corrector inference for a single payable."""
         chain = self.corrector_chain or _corrector_for(
-            self.settings.structuring_model, self.settings.structuring_temperature
+            self.settings.effective_structuring_model(),
+            self.settings.structuring_temperature,
         )
 
         from src.validation import MasterDataValidator

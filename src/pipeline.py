@@ -68,14 +68,16 @@ def process_document(
     try:
         document = read_pdf(
             pdf_path,
-            min_text_chars=cfg.text_layer_min_chars,
+            min_text_chars=cfg.effective_text_layer_min_chars(),
             dpi=cfg.pdf_render_dpi,
         )
         # Vision routing: the vision model (qwen/qwen3.8-27b) is invoked ONLY
-        # for pages rasterised as images (embedded text layer shorter than
-        # ``text_layer_min_chars`` ==> 0 usable chars). Text-layer pages are
-        # returned verbatim by ``extract_document_text`` and never reach the
-        # vision API, so scanning a text-layer PDF costs zero vision tokens.
+        # for pages rasterised as images (embedded text layer shorter than the
+        # effective ``text_layer_min_chars`` threshold ==> 0 usable chars).
+        # Text-layer pages — including every page above the fast-mode "50 char"
+        # rule — are returned verbatim by ``extract_document_text`` and never
+        # reach the vision API, so scanning a text-layer PDF costs zero vision
+        # tokens.
         extract_document_text(document, chain=vision_chain, settings=cfg)
         document_text = document.text()
     except Exception as exc:  # noqa: BLE001 - degrade to argued 'declined'

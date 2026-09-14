@@ -123,6 +123,46 @@ def test_max_retries_cap_respected_with_zero_retries() -> None:
     assert result.attempts <= 1
 
 
+def test_zero_retries_is_single_pass_no_corrector() -> None:
+    """Fast mode caps retries at 0: propose + validate only, no Corrector calls."""
+    master = MasterData.load(MASTER_DIR)
+    corrector_calls: list[dict] = []
+
+    def _bad_proposer(_inputs: dict) -> FileOutput:
+        return FileOutput(file="INV-99.pdf",
+                          payables=[Autodraft(invoice_number="1", currency="EUR", gross_total="999.00")])
+
+    def _corrector(inputs: dict) -> Autodraft:
+        corrector_calls.append(inputs)
+        return _clean_autodraft()
+
+    loop = ValidationLoop(
+        master=master,
+        max_retries=0,
+        structuring_chain=RunnableLambda(_bad_proposer),
+        corrector_chain=RunnableLambda(_corrector),
+    )
+    result = loop.run(_DOC_TEXT, "INV-99.pdf")
+    # Errors remain (nothing corrected), but zero LLM correction inferences ran.
+    assert result.attempts == 0
+    assert corrector_calls == []
+    assert result.converged is False
+    assert loop.stats["corrections"] == 0
+
+
+def test_loop_default_retries_honor_fast_mode_settings() -> None:
+    """A ValidationLoop built from fast-mode settings defaults to 0 retries."""
+    from src.config import Settings
+
+    master = MasterData.load(MASTER_DIR)
+    loop = ValidationLoop(
+        master=master,
+        settings=Settings(fast_mode=True),
+        structuring_chain=RunnableLambda(lambda _i: FileOutput(file="X.pdf")),
+    )
+    assert loop.max_retries == 0
+
+
 def test_declined_documents_never_enter_corrector() -> None:
     """A declined (no payable) document must produce no correction calls."""
     master = MasterData.load(MASTER_DIR)

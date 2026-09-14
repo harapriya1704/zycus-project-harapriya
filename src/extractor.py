@@ -121,6 +121,27 @@ def _has_api_key(settings: Settings) -> bool:
     return bool(settings.provider_api_key())
 
 
+def _local_ocr(image_path: Path) -> str | None:
+    """Attempt local CPU-based OCR via pytesseract.
+
+    Returns the extracted text, or ``None`` if pytesseract is not installed
+    or OCR fails. This avoids Vision LLM API calls entirely for scanned
+    pages when a usable local OCR engine is available.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        img = Image.open(image_path)
+        text = pytesseract.image_to_string(img)
+        return text.strip() if text and text.strip() else None
+    except Exception as exc:
+        log.debug("Local OCR failed for %s: %s", image_path, exc)
+        return None
+
+
 def build_image_transcription_chain(
     model: str | None = None,
     temperature: float | None = None,
@@ -231,6 +252,15 @@ def transcribe_page(
     cfg = get_settings()
     need = cfg.require_vision if require_vision is None else require_vision
 
+    # Fast mode: attempt local CPU-based OCR before falling back to the
+    # vision LLM chain.  This eliminates base64 encoding overhead and
+    # Vision TPM rate-limit pressure for scanned pages.
+    if cfg.fast_mode and page.image_path is not None:
+        ocr_text = _local_ocr(page.image_path)
+        if ocr_text:
+            log.info("Local OCR extracted %s chars from page %s", len(ocr_text), page.index)
+            return ocr_text
+
     if chain is None:
         message = (
             f"Page {page.index} of an image-only document needs vision "
@@ -302,7 +332,7 @@ def extract_document_text(
             len(document.needs_vision),
         )
 
-    pacing = max(0.0, float(cfg.vision_pacing_delay or 0.0))
+    pacing = cfg.effective_vision_pacing_delay()
 
     completed: list[PdfPage] = []
     vision_calls = 0
