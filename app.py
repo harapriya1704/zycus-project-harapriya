@@ -18,6 +18,7 @@ Layout:
 from __future__ import annotations
 
 import json
+import queue
 import sys
 import threading
 import time
@@ -147,24 +148,32 @@ def _audit_payable(payable: dict) -> None:
 def _launch_pipeline(pdf_path: Path, validate: bool, fast: bool) -> None:
     """Run the pipeline for one PDF off the UI thread.
 
-    The browser stays responsive while Groq rate-limit back-off retries; the
-    result (or a clean error) lands back in session state for the next rerun.
+    Results travel back through a thread-safe :class:`queue.Queue` (plus a
+    completion :class:`threading.Event`); the worker thread never touches
+    ``st.session_state``. Streamlit keeps its session state bound to the main
+    script thread (new ``threading.Thread`` instances get no ScriptRunContext),
+    so direct writes from a worker would land in a throwaway mock state and the
+    busy-wait rerun below would never see them — the UI would spin forever on
+    "Pipeline running".
     """
+
+    result_queue: queue.Queue[tuple[str, dict | str]] = queue.Queue()
+    done_event = threading.Event()
 
     def _work() -> None:
         try:
-            st.session_state["pipeline_result"] = _run_pipeline(pdf_path, validate, fast)
-            st.session_state["pipeline_error"] = None
+            result = _run_pipeline(pdf_path, validate, fast)
+            result_queue.put(("result", result))
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI, never kill the thread
             from src.llm_retry import describe_error
 
-            st.session_state["pipeline_result"] = None
-            st.session_state["pipeline_error"] = describe_error(exc)
+            result_queue.put(("error", describe_error(exc)))
         finally:
-            st.session_state["pipeline_done"] = True
+            done_event.set()
 
+    st.session_state["pipeline_queue"] = result_queue
+    st.session_state["pipeline_done_event"] = done_event
     st.session_state["pipeline_running"] = True
-    st.session_state["pipeline_done"] = False
     st.session_state["pipeline_result"] = None
     st.session_state["pipeline_error"] = None
     st.session_state["pipeline_thread"] = threading.Thread(target=_work, daemon=True)
@@ -244,7 +253,6 @@ def _main() -> None:
 
     st.session_state.setdefault("results", {})
     st.session_state.setdefault("pipeline_running", False)
-    st.session_state.setdefault("pipeline_done", False)
     st.session_state.setdefault("pipeline_result", None)
     st.session_state.setdefault("pipeline_error", None)
     st.session_state.setdefault("last_error", None)
@@ -276,21 +284,29 @@ def _main() -> None:
             _launch_pipeline(pdf_path, validate, fast)
 
     if st.session_state["pipeline_running"]:
-        if st.session_state["pipeline_done"]:
-            new_result = st.session_state["pipeline_result"]
-            error = st.session_state["pipeline_error"]
-            if new_result is not None:
-                st.session_state["results"][pdf_path.stem] = new_result
-            st.session_state["pipeline_running"] = False
-            st.session_state["pipeline_done"] = False
-            st.session_state["pipeline_result"] = None
-            st.session_state["pipeline_error"] = None
-            if error is not None:
+        done_event: threading.Event | None = st.session_state.get("pipeline_done_event")
+        if done_event is not None and done_event.is_set():
+            # The worker finished: drain its queue and apply the outcome from
+            # the main thread (session state may only be touched here).
+            result_queue: queue.Queue[tuple[str, dict | str]] = st.session_state[
+                "pipeline_queue"
+            ]
+            kind, payload = result_queue.get_nowait()
+            if kind == "result":
+                st.session_state["pipeline_result"] = payload
+                st.session_state["pipeline_error"] = None
+                st.session_state["results"][pdf_path.stem] = payload
+            else:
+                st.session_state["pipeline_result"] = None
+                st.session_state["pipeline_error"] = payload
                 # Kept for the expander in the results column (shown once).
-                st.session_state["last_error"] = error
+                st.session_state["last_error"] = payload
+            st.session_state["pipeline_running"] = False
+            st.session_state["pipeline_queue"] = None
+            st.session_state["pipeline_done_event"] = None
         else:
             # Busy-wait rerun: the UI thread must keep returning so the page
-            # stays interactive; each rerun re-checks the done flag.
+            # stays interactive; each rerun re-checks the done event.
             time.sleep(0.25)
             st.info("Pipeline running — this page refreshes automatically when it completes.")
             st.rerun()
