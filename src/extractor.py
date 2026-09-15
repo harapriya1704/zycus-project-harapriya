@@ -1,14 +1,17 @@
-"""Document text extraction via a LangChain vision-LLM chain.
+"""Document text extraction via local easyocr OCR (default) and/or a vision-LLM chain.
 
 This is the "read the document" stage. A document arrives as a
 :class:`src.pdf_reader.Document`; for every page whose embedded text layer is
-usable we reuse it verbatim (no API spend), and for image-only pages we send the
-rasterised page to a vision-capable chat model built through LangChain
+usable we reuse it verbatim (no OCR / API spend). Image-only pages are
+transcribed by **local easyocr CPU OCR** by default — the Vision LLM never runs
+unless it is manually triggered (``use_llm`` / ``INV_USE_LLM`` / ``--use-llm``).
+When it is, the pages easyocr cannot read are rasterised and sent to a
+vision-capable chat model built through LangChain
 (:class:`langchain_openai.ChatOpenAI`).
 
 The extraction model is deliberately kept as a thin, swappable LangChain
 ``Runnable`` (:func:`build_image_transcription_chain`) so tests can inject a
-fake model and later phases can swap OCR vendors without touching callers.
+fake model and later phases can swap the Vision vendor without touching callers.
 """
 
 from __future__ import annotations
@@ -16,7 +19,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import math
-import shutil
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -162,65 +164,70 @@ def _has_api_key(settings: Settings) -> bool:
 
 
 #: A local OCR result must carry at least this many printable characters to
-#: be trusted; anything shorter is treated as "no readable text" and the page
-#: falls through to the Vision API.
+#: be trusted; anything shorter is treated as "no readable text".
 _OCR_MIN_CHARS = 50
+
+#: Lazy, process-wide easyocr ``Reader`` (see :func:`_get_easyocr_reader`).
+_easyocr_reader: Any | None = None
+_easyocr_reader_tried = False
+
+
+def _get_easyocr_reader() -> Any | None:
+    """Return the module-level easyocr ``Reader`` (lazily constructed once).
+
+    Loading easyocr pulls in torch and downloads its detection/recognition
+    weights on first use, so the reader is built a single time and reused for
+    every page. Returns ``None`` when easyocr is not installed or its reader
+    fails to start — the OCR path then reports "nothing readable" and the page
+    is left to vision (when triggered) or stays empty.
+    """
+    global _easyocr_reader, _easyocr_reader_tried
+    if _easyocr_reader_tried:
+        return _easyocr_reader
+    _easyocr_reader_tried = True
+    try:
+        import easyocr
+    except ImportError:
+        log.info("easyocr is not installed: local OCR unavailable")
+        return None
+    try:
+        _easyocr_reader = easyocr.Reader(["en"], gpu=False)
+    except Exception as exc:  # noqa: BLE001 - surface the underlying startup failure
+        log.debug("Could not start the easyocr Reader: %s", exc)
+        return None
+    return _easyocr_reader
 
 
 def _local_ocr(image_path: Path) -> str | None:
-    """Attempt local CPU-based OCR via pytesseract.
+    """Attempt local CPU-based OCR via easyocr.
 
     The page is downscaled (longest side at most :data:`_IMAGE_MAX_EDGE` px)
-    before OCR so the CPU-bound tesseract job stays fast; the extracted text
-    is returned only when it carries at least :data:`_OCR_MIN_CHARS`
-    printable characters, else ``None``. Returns ``None`` when pytesseract is
-    not installed or OCR fails. When usable, the text is handed straight to
-    the structuring model — the Vision API call (and its TPM cost) is skipped.
+    before OCR so the CPU-bound job stays fast; the extracted text is returned
+    only when it carries at least :data:`_OCR_MIN_CHARS` printable characters,
+    else ``None``. Returns ``None`` when easyocr is not installed or OCR
+    fails. When usable, the text is handed straight to the structuring stage —
+    no Vision API call (and no token spend) happens on a default run.
     """
-    try:
-        import pytesseract
-        from PIL import Image, ImageOps
-    except ImportError:
+    reader = _get_easyocr_reader()
+    if reader is None:
         return None
     try:
-        # The UB-Mannheim installer does not add tesseract.exe to PATH, so
-        # point pytesseract at the binary explicitly when it is not on PATH.
-        exe = pytesseract.pytesseract.tesseract_cmd or "tesseract"
-        if not _tesseract_available(exe):
-            for candidate in _TESSERACT_CANDIDATES:
-                if _tesseract_available(str(candidate)):
-                    pytesseract.pytesseract.tesseract_cmd = str(candidate)
-                    break
-            else:
-                return None
+        import numpy as np
+        from PIL import Image
+
         with Image.open(image_path) as img:
             img.thumbnail((_IMAGE_MAX_EDGE, _IMAGE_MAX_EDGE), Image.Resampling.LANCZOS)
-            if img.mode not in ("L", "RGB"):
-                img = ImageOps.grayscale(img)
-            text = pytesseract.image_to_string(img)
-        text = text.strip() if text else ""
-        if len("".join(text.split())) < _OCR_MIN_CHARS:
-            return None
-        return text
-    except Exception as exc:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            array = np.asarray(img)
+        lines = reader.readtext(array, detail=0, paragraph=False)
+    except Exception as exc:  # noqa: BLE001 - OCR must never kill a page
         log.debug("Local OCR failed for %s: %s", image_path, exc)
         return None
-
-
-#: Common install locations for the Tesseract binary on Windows.
-_TESSERACT_CANDIDATES: tuple[Path, ...] = (
-    Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
-    Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
-    Path.home() / "AppData" / "Local" / "Programs" / "Tesseract-OCR" / "tesseract.exe",
-    Path.home() / "AppData" / "Local" / "Tesseract-OCR" / "tesseract.exe",
-)
-
-
-def _tesseract_available(exe: str | Path) -> bool:
-    """True when ``exe`` names an on-disk tesseract executable."""
-    if Path(str(exe)).exists() and Path(str(exe)).is_file():
-        return True
-    return exe == "tesseract" and shutil.which("tesseract") is not None
+    text = "\n".join(str(part).strip() for part in lines if str(part).strip())
+    if len("".join(text.split())) < _OCR_MIN_CHARS:
+        return None
+    return text
 
 
 #: Fraction of dark pixels below which a rendered page is treated as blank.
@@ -374,12 +381,12 @@ def transcribe_page(
     cfg = settings or get_settings()
 
     # ── Fast Testing Mode: HARD Vision API BYPASS ──────────────────────
-    # While ``--fast`` is active the Vision LLM chain (e.g.
-    # ``qwen/qwen3.8-27b``) must NEVER be invoked, under any circumstances.
-    # Native text already extracted via PyMuPDF is reused when significant
-    # (>= 50 chars); otherwise a short/empty text layer is supplemented by
-    # local CPU-based pytesseract OCR. Whatever that yields — even ``""`` —
-    # is returned directly; execution never falls through to the vision chain.
+    # While ``--fast`` is active the Vision LLM chain must NEVER be invoked,
+    # under any circumstances. Native text already extracted via PyMuPDF is
+    # reused when significant (>= 50 chars); otherwise a short/empty text
+    # layer is supplemented by local CPU-based easyocr OCR. Whatever that
+    # yields — even ``""`` — is returned directly; execution never falls
+    # through to the vision chain.
     if cfg.fast_mode:
         text = page.text or ""
         if (
@@ -440,15 +447,19 @@ def extract_document_text(
     """Extract the full text of a document, page by page.
 
     Mutates ``document`` in place: image-only pages get their ``text`` field
-    populated from the vision chain and their ``image_path`` cleared once
-    transcribed (token spend is per page, never repeated). Pages already in the
-    on-disk transcription cache are read back without any API call and without
-    pacing.
+    populated from local easyocr OCR and, when the Vision LLM is triggered
+    (``use_llm`` / an explicit ``chain``), from the vision chain for the pages
+    OCR cannot read; each transcribed ``image_path`` is cleared once the page is
+    resolved (token spend is per page, never repeated). Pages already in the
+    on-disk transcription cache are read back without any OCR or API call and
+    without pacing.
 
     Args:
         document: the ingested document.
         chain: the vision transcription runnable; built on demand from the
-            default model when ``None`` and an API key is present.
+            default model when ``None``, LLM use is triggered (``use_llm``)
+            and an API key is present. When no vision runnable is available,
+            image pages OCR cannot read are left empty.
         settings: settings source; defaults to the process singleton.
         cache_dir: transcription cache directory; defaults to the configured
             value.
@@ -459,17 +470,25 @@ def extract_document_text(
     cfg = settings or get_settings()
     cache = cache_dir or cfg.resolved_transcription_dir()
 
-    # The Vision LLM chain is only ever built for precision mode. Fast mode
-    # hard-bypasses it: ``transcribe_page`` resolves image pages via local
-    # OCR, so constructing a vision chain here would be pure overhead (and a
-    # latent fallback path). Callers may still pass an explicit chain for
-    # tests, but it is never invoked in fast mode.
+    # The Vision LLM chain is only ever built when the user manually triggered
+    # LLM use (``use_llm``) and the run is not in fast mode. Fast mode
+    # hard-bypasses it: ``transcribe_page`` resolves image pages via local OCR,
+    # so constructing a vision chain would be pure overhead (and a latent
+    # fallback path). Callers may still pass an explicit chain for tests, but
+    # it is never invoked in fast mode. Without a chain, unreadable image
+    # pages stay empty on a default run instead of spending vision tokens.
     need_chain = any(not p.text.strip() and p.image_path for p in document.pages)
     effective_chain = chain
-    if not cfg.fast_mode and effective_chain is None and need_chain and _has_api_key(cfg):
+    if (
+        not cfg.fast_mode
+        and cfg.use_llm
+        and effective_chain is None
+        and need_chain
+        and _has_api_key(cfg)
+    ):
         effective_chain = _chain_for(cfg.vision_model, cfg.extraction_temperature)
         log.info(
-            "Using vision model '%s' for %s image pages",
+            "Using vision model '%s' for %s image pages (LLM manually triggered)",
             cfg.vision_model,
             len(document.needs_vision),
         )
@@ -522,9 +541,7 @@ def extract_document_text(
                 else:
                     # Local OCR first: a readable scanned page is transcribed
                     # on the CPU and fed to structuring directly, so no base64
-                    # payload ever reaches the Vision model (zero TPM spend).
-                    # Only pages OCR cannot read fall through to the batched,
-                    # serialised Vision API path below.
+                    # payload ever reaches the Vision model (zero token spend).
                     ocr_text = _local_ocr(page.image_path)
                     if ocr_text and len("".join(ocr_text.split())) >= _OCR_MIN_CHARS:
                         text = ocr_text
@@ -537,12 +554,15 @@ def extract_document_text(
                             document.filename,
                         )
                         ocr_count += 1
-                    else:
-                        # Batched, serialised vision processing: every call is
-                        # separated by ``pacing`` seconds (never sent
-                        # concurrently), and an extra ``batch_pause`` is added
-                        # at batch boundaries (every ``batch_size`` pages) to
-                        # stay cleanly under the Groq TPM/RPM ceiling.
+                    elif effective_chain is not None or cfg.effective_use_vision_llm():
+                        # The Vision LLM is active here only because it was
+                        # manually triggered (``--use-llm`` / ``INV_USE_LLM``)
+                        # or a chain was supplied explicitly. Batched, serialised
+                        # vision processing: every call is separated by
+                        # ``pacing`` seconds (never sent concurrently), and an
+                        # extra ``batch_pause`` is added at batch boundaries
+                        # (every ``batch_size`` pages) to stay cleanly under the
+                        # provider TPM/RPM ceiling.
                         if vision_calls > 0 and batch_calls == 0 and batch_pause > 0:
                             time.sleep(batch_pause)
                         if vision_calls > 0 and pacing > 0:
@@ -571,6 +591,17 @@ def extract_document_text(
                             batch_calls = 0
                         if text:
                             vision_count += 1
+                    else:
+                        # No LLM trigger and nothing readable from local OCR:
+                        # leave the page honest-empty rather than spending
+                        # vision tokens. The structuring stage declines it.
+                        log.info(
+                            "Page %s of %s: OCR yielded no text and the Vision LLM is not "
+                            "triggered (--use-llm / INV_USE_LLM); leaving empty",
+                            page.index,
+                            document.filename,
+                        )
+                        text = ""
             page = PdfPage(
                 index=page.index,
                 width_pt=page.width_pt,

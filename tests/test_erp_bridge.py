@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 from erp import erp_book
-from src.config import PROJECT_ROOT, get_settings
+from src.config import PROJECT_ROOT, Settings
 from src.master_data import MasterData
 from src.schemas import Autodraft
 from src.validation import MasterDataValidator
@@ -93,11 +93,21 @@ def test_check_outputs_bridge_runs_clean(tmp_path: Path) -> None:
 
 
 def test_settings_provider_defaults() -> None:
-    """Full-HF wins: vision AND text reasoning run on HF Serverless."""
-    cfg = get_settings()
+    """Deployed topology: vision on HF Serverless, text reasoning on Groq.
+
+    Constructed with explicit values (hermetic — never coupled to the local
+    ``.env``), mirroring the running configuration.
+    """
+    cfg = Settings(
+        vision_model="zai-org/GLM-4.5V",
+        vision_base_url="https://router.huggingface.co/v1",
+        text_model="qwen/qwen3.8-27b",
+        text_base_url="https://api.groq.com/openai/v1",
+        groq_base_url="https://api.groq.com/openai/v1",
+    )
     assert cfg.vision_model == "zai-org/GLM-4.5V"
     assert cfg.vision_base_url == "https://router.huggingface.co/v1"
-    assert cfg.text_model == "meta-llama/Llama-3.3-70B-Instruct"
-    assert cfg.text_base_url == "https://router.huggingface.co/v1"
+    assert cfg.text_model == "qwen/qwen3.8-27b"
+    assert cfg.text_base_url == "https://api.groq.com/openai/v1"
     assert cfg.groq_base_url == "https://api.groq.com/openai/v1"
     assert cfg.max_retries == 3

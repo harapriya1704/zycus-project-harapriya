@@ -11,10 +11,11 @@ pydantic-settings>=2.3.0
 pymupdf>=1.24.0
 pypdf>=5.0.0
 
-# ── Local OCR fallback (fast mode) ────────────────────────────────
-# pytesseract + Pillow enable CPU-based OCR for scanned pages so the
-# Vision LLM API is bypassed entirely in fast mode.
-pytesseract>=0.3.10
+# ── Local OCR (default extraction path) ─────────────────────────────
+# easyocr provides CPU-based OCR for scanned pages so a default run (no
+# --use-llm) never needs the Vision LLM. torch is pulled in transitively.
+easyocr>=1.7.1
+numpy>=1.24.0
 Pillow>=10.0.0
 
 # ── Runtime / env ─────────────────────────────────────────────────

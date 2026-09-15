@@ -125,6 +125,13 @@ class Settings(BaseSettings):
     #: Sampling temperature for vision transcription (referenced here; the
     #: vision model itself now lives in the Hugging Face section above).
     extraction_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
+    #: Manual trigger for the Vision transcription LLM. ``False`` (the default)
+    #: keeps a pipeline run fully local: image-only pages are transcribed by
+    #: local easyocr CPU OCR and the Vision API is never called. Set
+    #: ``INV_USE_LLM=true`` (or pass ``--use-llm`` on the CLI) to additionally
+    #: send the pages easyocr cannot read to the multimodal vision model.
+    #: Read from ``INV_USE_LLM``.
+    use_llm: bool = Field(default=False)
     #: When True, refuse to silently return an empty transcription for an
     #: image-only page if no LLM is configured; raises instead.
     require_vision: bool = Field(default=True)
@@ -218,6 +225,23 @@ class Settings(BaseSettings):
         """
         return 0.0 if self.fast_mode else self.vision_pacing_delay
 
+    def effective_use_vision_llm(self) -> bool:
+        """Whether the Vision transcription LLM is active for this run.
+
+        The Vision LLM is used only when both conditions hold:
+
+        - fast mode is **off** (``--fast`` hard-bypasses the Vision API — image
+          pages are resolved by local easyocr OCR instead), and
+        - ``use_llm`` is True, i.e. the user manually triggered LLM usage via
+          ``--use-llm`` / ``INV_USE_LLM=true``.
+
+        A default run therefore never reaches an API for extraction: unreadable
+        image pages are left empty for the structuring stage to decline
+        honestly rather than spending vision tokens (or failing on a missing
+        key).
+        """
+        return not self.fast_mode and self.use_llm
+
     def effective_max_retries(self) -> int:
         """Correction iterations allowed by the validation loop.
 
@@ -304,12 +328,17 @@ class Settings(BaseSettings):
     ):
         """Build a ``ChatOpenAI`` for text reasoning.
 
-        Default route: Groq (``groq_base_url`` + ``GROQ_API_KEY``), which
-        serves the OpenAI gpt-oss weights. When ``text_base_url`` is set
-        (``INV_TEXT_BASE_URL``) the call goes there instead and, falling back
-        to the legacy OpenAI-compatible key, the Hugging Face token is used —
-        this is the pure Full-HF configuration that is independent of Groq's
-        TPD/TPM quotas.
+        Route selection: when ``text_base_url`` is set (``INV_TEXT_BASE_URL``)
+        the call goes there; otherwise it rides ``groq_base_url`` (Groq, which
+        serves the OpenAI gpt-oss weights). The credential follows the **route**:
+
+        - a non-Groq ``text_base_url`` (e.g. the HF Serverless router) prefers
+          the Hugging Face token so a pure Full-HF topology works with no Groq
+          TPD/TPM participation;
+        - a Groq endpoint (``text_base_url`` equal to ``groq_base_url``, or no
+          override at all) prefers ``GROQ_API_KEY`` so the pipeline never sends
+          an HF token to Groq.
+        ``INV_LLM_API_KEY`` / ``OPENAI_API_KEY`` remain legacy fallbacks.
 
         Args:
             model: text-reasoning model; defaults to
@@ -330,12 +359,23 @@ class Settings(BaseSettings):
 
         if self.text_base_url:
             base_url = self.text_base_url
-            api_key = (
-                self.hf_token
-                or self.groq_api_key
-                or self.llm_api_key
-                or os.environ.get("OPENAI_API_KEY", "")
-            )
+            if base_url.rstrip("/") == self.groq_base_url.rstrip("/"):
+                # Explicit override that targets Groq: use the Groq credential.
+                api_key = (
+                    self.groq_api_key
+                    or self.hf_token
+                    or self.llm_api_key
+                    or os.environ.get("OPENAI_API_KEY", "")
+                )
+            else:
+                # Non-Groq override (e.g. the HF Serverless router): the HF
+                # token is the right credential for this endpoint.
+                api_key = (
+                    self.hf_token
+                    or self.groq_api_key
+                    or self.llm_api_key
+                    or os.environ.get("OPENAI_API_KEY", "")
+                )
             if not api_key:
                 raise RuntimeError(
                     "Cannot build the text LLM on the text_base_url route: no "

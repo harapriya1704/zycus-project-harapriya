@@ -35,9 +35,9 @@ The vision: an accounts-payable team approves exceptions instead of keying docum
  documents/*.pdf │                                             │
                  ▼                                             │
       ┌───────────────────┐     ┌─────────────────────────┐   │
-      │  READ (PyMuPDF)   │────▶│ EXTRACT (vision LLM)   │   │
-      │  text layer /     │     │ pymupdf raster + Groq   │   │
-      │  image detection  │     │ transcription           │   │
+      │  READ (PyMuPDF)   │────▶│ EXTRACT (easyocr /    │   │
+      │  text layer /     │     │ vision LLM, opt-in)  │   │
+      │  image detection  │     │ local OCR by default │   │
       └───────────────────┘     └────────────┬────────────┘   │
                                              ▼                │
                  ┌─────────────────────────────────────────┐   │
@@ -83,16 +83,16 @@ The vision: an accounts-payable team approves exceptions instead of keying docum
 
 The pipeline is **provider-agnostic by construction**: every LLM — vision transcription *and* text reasoning — is built by `Settings.get_vision_llm()` / `Settings.get_text_llm()`, which resolve the endpoint, credential, and model purely from environment variables. Nothing is hard-coded to a single vendor; the same binary switches between **Hugging Face Serverless Inference** (`https://router.huggingface.co/v1`) and **Groq** (`https://api.groq.com/openai/v1`) by editing `.env`.
 
-| Role | Production default                | `HF_TOKEN` route                      | `GROQ_API_KEY` route         |
-|------|-----------------------------------|---------------------------------------|------------------------------|
-| Vision (scan/image pages) | `zai-org/GLM-4.5V` | `INV_VISION_BASE_URL` = HF router | `INV_VISION_BASE_URL` = Groq |
-| Text (structuring, validation, correction) | `meta-llama/Llama-3.3-70B-Instruct` | `INV_TEXT_BASE_URL` = HF router (`INV_TEXT_MODEL`) | `text_base_url` empty → `groq_base_url` (`INV_TEXT_MODEL`) |
+| Role | Default (shipped `.env`)            | On Groq                                | On Hugging Face                        |
+|------|-------------------------------------|----------------------------------------|----------------------------------------|
+| Vision (scan/image pages, opt-in) | `zai-org/GLM-4.5V` on HF | `INV_VISION_BASE_URL` = Groq | `INV_VISION_BASE_URL` = HF router (`INV_VISION_MODEL`) |
+| Text (structuring, validation, correction) | `qwen/qwen3.8-27b` on Groq | `INV_TEXT_BASE_URL` = Groq (`INV_TEXT_MODEL`) | `INV_TEXT_BASE_URL` = HF router (`INV_TEXT_MODEL`) |
 
 Key orchestration behaviour:
 
 - **Environment-driven, zero code changes.** `INV_VISION_BASE_URL`, `INV_TEXT_BASE_URL`, `INV_GROQ_BASE_URL`, `INV_VISION_MODEL`, `INV_TEXT_MODEL` — plus `HF_TOKEN` / `GROQ_API_KEY` — fully determine the deployed topology.
-- **Full-HF topology (recommended).** Both vision and text reasoning ride the HF Serverless router: the whole pipeline becomes *independent of Groq's daily TPD/TPM quotas* — the #1 source of HTTP 429 stalls.
-- **Hybrid topology.** GLM-4.5V vision on HF + gpt-oss-120b text on Groq for maximum throughput on the fastest text inference.
+- **Hybrid topology (the shipped default).** Vision on the **Hugging Face** router (`zai-org/GLM-4.5V`) and text reasoning on **Groq** (`qwen/qwen3.8-27b`). Vision is **opt-in** (`--use-llm` / `INV_USE_LLM=true`) — a plain `python run.py` never calls it, so the default run spends **zero** vision tokens.
+- **Full-HF topology.** Both vision and text reasoning ride the HF Serverless router, independent of Groq's per-model TPD/TPM quotas.
 - **Provider validation at startup.** Model availability is probed up front (see *Verification Tools* below) so a misconfigured/un-deployed model is caught before a long batch run begins.
 
 Rationale:
@@ -128,9 +128,12 @@ and operators — rate limits, timeouts, partial disk writes, and UI hangs inclu
 
 3. **Zero-token text-layer routing (`src/pipeline.py` & `src/extractor.py`).** Pages
    whose embedded text layer is usable are returned verbatim and **never** contact the
-   vision API. The multimodal model is strictly isolated to image-only pages
-   (`text_layer_min_chars`, default 80), and consecutive vision calls are paced by a
-   configurable `INV_VISION_PACING_DELAY` (default 2.0 s) to keep Groq TPM/RPM flat
+   vision API, and image-only pages are transcribed by **local easyocr CPU OCR** by
+   default (`INV_USE_LLM=false` / no `--use-llm`): a plain `python run.py` spends **zero**
+   vision tokens. Pass `--use-llm` (or `INV_USE_LLM=true`) to additionally route the
+   pages easyocr cannot read to the multimodal model
+   (`text_layer_min_chars`, default 80), with consecutive vision calls paced by a
+   configurable `INV_VISION_PACING_DELAY` (default 2.0 s) to keep provider TPM/RPM flat
    on multi-page scans. Text-layer re-runs cost **zero** vision tokens.
 
 4. **Thread-safe Streamlit architecture (`app.py`).** The dashboard never blocks on a
@@ -173,7 +176,8 @@ and operators — rate limits, timeouts, partial disk writes, and UI hangs inclu
 ### 1. Prerequisites
 
 - Python **3.10+** (developed on 3.13).
-- A Groq API key (or any OpenAI-compatible endpoint).
+- A Groq API key, or any OpenAI-compatible endpoint.
+- An `HF_TOKEN` (only if you opt into the Vision LLM with `--use-llm`).
 
 ### 2. Install dependencies
 
@@ -183,30 +187,43 @@ pip install -r requirements.txt
 
 ### 3. Configure credentials
 
-Copy the template and fill in your key:
+Copy the template and fill in your key. The shipped hybrid topology needs:
 
 ```bash
 cp .env.example .env
 # edit .env:
-#   OPENAI_API_KEY=gsk_...
-#   OPENAI_BASE_URL=https://api.groq.com/openai/v1
+#   GROQ_API_KEY=gsk_...                       # text reasoning (structuring, validation, correction)
+#   INV_TEXT_BASE_URL=https://api.groq.com/openai/v1
+#   INV_TEXT_MODEL=qwen/qwen3.8-27b
+#   HF_TOKEN=hf_...                            # vision only — needed just for --use-llm / INV_USE_LLM=true
+#   INV_VISION_BASE_URL=https://router.huggingface.co/v1
+#   INV_VISION_MODEL=zai-org/GLM-4.5V
+#   INV_USE_LLM=false                          # vision is opt-in; a default run is fully local
 ```
 
-Defaults target **`qwen/qwen3.8-27b`** (multimodal vision) on Groq for image/scan transcription and **`openai/gpt-oss-120b`** for structuring. If your gateway exposes different ids — and keep the vision model *multimodal* — override per-run or in `.env`:
+Defaults (current `.env`): text/structuring = **`qwen/qwen3.8-27b`** on **Groq**; vision (opt-in) = **`zai-org/GLM-4.5V`** on the **Hugging Face** router. If your gateway exposes different model ids — and keep the vision model *multimodal* — override per-run or in `.env`:
 
 ```bash
-export INV_VISION_MODEL=qwen/qwen3.8-27b
-export INV_STRUCTURING_MODEL=openai/gpt-oss-120b
+export INV_TEXT_MODEL=qwen/qwen3.8-27b
+export INV_VISION_MODEL=zai-org/GLM-4.5V
 ```
 
 ### 4. Run the pipeline
 
 ```bash
 # Full pipeline over documents/ -> output/*.json  (one JSON per PDF)
+# Default run is fully local: image pages transcribed by easyocr OCR, the
+# Vision LLM is never called (zero vision tokens spent).
 python run.py
+
+# Manually trigger the Vision LLM for pages easyocr cannot read
+python run.py --use-llm
 
 # With the multi-agent validation loop (day-2)
 python run.py --validate
+
+# Fast Testing Mode: bypass vision for text pages, cap retries to 0
+python run.py --fast
 
 # Dry run: list the input PDFs
 python run.py --list
@@ -285,7 +302,7 @@ without re-running the pipeline; clicking **Run Pipeline** regenerates it.
 | `run.py` | One-command runner (`--validate` enables the agent loop) |
 | `check_outputs.py` | ERP bridge: validated outputs → `erp_book` → MATCH/MISMATCH |
 | `src/pdf_reader.py` | PDF ingest, text/image detection, rasterisation |
-| `src/extractor.py` | Vision LLM transcription of image-only pages |
+| `src/extractor.py` | easyocr CPU OCR by default + opt-in Vision LLM transcription |
 | `src/schemas.py` | Pydantic models mirroring `AUTODRAFT_SCHEMA.md` |
 | `src/master_data.py` | O(1)-indexed master-data resolution (no guesses) |
 | `src/formatter.py` | LLM structuring chain + provider-agnostic JSON parser |
@@ -295,7 +312,7 @@ without re-running the pipeline; clicking **Run Pipeline** regenerates it.
 | `src/pipeline.py` | Per-file orchestration and `output/` writing |
 | `scripts/check_models.py` | Pre-flight provider health-check (HF Serverless + Groq probes) |
 | `scripts/benchmark.py` | Comparative latency/429/ERP benchmark across Full-HF / Hybrid / Full-Groq |
-| `tests/` | 104+ unit + integration tests (schema, matching, loop, ERP bridge, retries) |
+| `tests/` | 150+ unit + integration tests (schema, matching, loop, ERP bridge, retries, routing) |
 | `erp.py` | The ERP recompute oracle (fixed; graded as-is) |
 
 The original challenge brief is preserved in [`CHALLENGE_BRIEF.md`](CHALLENGE_BRIEF.md).

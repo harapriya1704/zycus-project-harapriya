@@ -38,17 +38,29 @@ def test_fast_mode_short_circuits_retries_pacing_and_vision() -> None:
 
 
 def test_hybrid_provider_defaults() -> None:
-    """Vision targets HF Serverless; text reasoning targets Groq."""
-    cfg = Settings()
+    """Vision targets HF Serverless; text reasoning targets Groq.
+
+    Constructed with explicit values (hermetic — never coupled to the local
+    ``.env``), mirroring the deployed default topology: vision on the HF
+    router, text reasoning rides Groq's OpenAI-compatible endpoint.
+    """
+    cfg = Settings(
+        vision_model="zai-org/GLM-4.5V",
+        vision_base_url="https://router.huggingface.co/v1",
+        text_model="qwen/qwen3.8-27b",
+        text_base_url="https://api.groq.com/openai/v1",
+        groq_base_url="https://api.groq.com/openai/v1",
+        fast_structuring_model="qwen/qwen3.8-27b",
+    )
     # Vision offloaded to the Hugging Face router.
     assert cfg.vision_model == "zai-org/GLM-4.5V"
     assert cfg.vision_base_url == "https://router.huggingface.co/v1"
     # Text reasoning follows INV_TEXT_MODEL / INV_TEXT_BASE_URL when set.
-    assert cfg.text_model == "meta-llama/Llama-3.3-70B-Instruct"
-    assert cfg.text_base_url == "https://router.huggingface.co/v1"
+    assert cfg.text_model == "qwen/qwen3.8-27b"
+    assert cfg.text_base_url == "https://api.groq.com/openai/v1"
     assert cfg.groq_base_url == "https://api.groq.com/openai/v1"
     assert cfg.structuring_model == ""  # no override -> text_model wins
-    assert cfg.fast_structuring_model == "meta-llama/Llama-3.3-70B-Instruct"
+    assert cfg.fast_structuring_model == "qwen/qwen3.8-27b"
     assert cfg.effective_structuring_model() == cfg.text_model
 
 
@@ -66,6 +78,15 @@ def test_vision_batching_knobs_are_overridable() -> None:
     assert cfg.vision_batch_size == 3
     assert cfg.vision_batch_pause == 1.5
     assert cfg.vision_skip_blank_pages is False
+
+
+def test_vision_llm_is_opt_in() -> None:
+    """The Vision LLM is a manual trigger: off by default, and fast mode
+    hard-bypasses it even when it is on."""
+    assert Settings().use_llm is False
+    assert Settings().effective_use_vision_llm() is False
+    assert Settings(use_llm=True).effective_use_vision_llm() is True
+    assert Settings(use_llm=True, fast_mode=True).effective_use_vision_llm() is False
 
 
 def test_fast_mode_respects_explicit_overrides() -> None:
@@ -175,3 +196,31 @@ def test_legacy_llm_api_key_still_builds_text_llm(monkeypatch) -> None:
     assert llm.openai_api_key.get_secret_value() == "test-key"
     # The Groq base URL always wins for text reasoning (provider-scoped).
     assert llm.openai_api_base == "https://api.groq.com/openai/v1"
+
+
+def test_text_llm_groq_override_uses_groq_key_not_hf_token() -> None:
+    """An INV_TEXT_BASE_URL targeting Groq must use the Groq credential —
+    never the HF token (which would 401 against Groq)."""
+    cfg = Settings(
+        hf_token="hf-token",
+        groq_api_key="gsk-text",
+        text_base_url="https://api.groq.com/openai/v1",
+        text_model="qwen/qwen3.8-27b",
+    )
+    llm = cfg.get_text_llm()
+    assert llm.openai_api_base == "https://api.groq.com/openai/v1"
+    assert llm.openai_api_key.get_secret_value() == "gsk-text"
+
+
+def test_text_llm_hf_override_uses_hf_token_first() -> None:
+    """A non-Groq INV_TEXT_BASE_URL (the HF Serverless router) prefers the HF
+    token so a pure Full-HF topology never touches Groq."""
+    cfg = Settings(
+        hf_token="hf-token",
+        groq_api_key="gsk-text",
+        text_base_url="https://router.huggingface.co/v1",
+        text_model="mock/gen-model",
+    )
+    llm = cfg.get_text_llm()
+    assert llm.openai_api_base == "https://router.huggingface.co/v1"
+    assert llm.openai_api_key.get_secret_value() == "hf-token"

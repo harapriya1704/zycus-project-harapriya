@@ -1,6 +1,6 @@
 """One-command runner for the day-1 pipeline.
 
-    python run.py [--input-dir DIR] [--output-dir DIR] [--validate] [--fast]
+    python run.py [--input-dir DIR] [--output-dir DIR] [--validate] [--fast] [--use-llm]
 
 Processes every ``*.pdf`` in ``documents/`` (default) and writes
 ``output/<name>.json`` for each — the output contract the grader consumes.
@@ -10,6 +10,11 @@ corrections, default 3) instead of the single-shot structuring chain.
 ``--fast`` enables Fast Testing Mode: pages with a usable text layer skip the
 vision LLM, the correction loop is capped to a single pass and structuring
 uses a lightweight model with a hard input-token budget.
+
+By default the Vision LLM is **not** triggered: image-only pages are
+transcribed by local easyocr OCR, so a plain run spends zero vision tokens.
+Pass ``--use-llm`` (or set ``INV_USE_LLM=true``) to additionally route the
+pages easyocr cannot read to the multimodal Vision model.
 
 Prerequisites: ``pip install -r requirements.txt`` and an ``OPENAI_API_KEY``
 (plus ``OPENAI_BASE_URL`` for a Groq-compatible endpoint) in the environment
@@ -61,10 +66,15 @@ def _cli(argv: list[str] | None = None) -> int:
                         help="Route documents through the multi-agent validation loop")
     parser.add_argument("--fast", action="store_true",
                         help="Fast Testing Mode: skip vision for text pages, cap retries to 0, fast LLM routing")
+    parser.add_argument("--use-llm", action="store_true", default=None,
+                        help="Manually trigger the Vision LLM for pages local OCR (easyocr) cannot read "
+                             "(default: fully local, no vision tokens spent)")
     parser.add_argument("--list", action="store_true", help="Only list matching PDFs, then exit")
     args = parser.parse_args(argv)
 
     cfg = Settings(fast_mode=args.fast)
+    if args.use_llm is not None:
+        cfg = Settings(fast_mode=args.fast, use_llm=args.use_llm)
     documents_dir = (args.input_dir or cfg.resolved_documents_dir()).resolve()
     output_dir = (args.output_dir or cfg.resolved_output_dir()).resolve()
     _configure_logging(args.log_level or cfg.log_level, output_dir)
@@ -72,6 +82,12 @@ def _cli(argv: list[str] | None = None) -> int:
     if args.fast:
         # Warn once up-front that --fast trades extraction precision for speed.
         log.warning(FAST_MODE_WARNING)
+    if cfg.use_llm and not cfg.fast_mode:
+        # Warn once that the Vision LLM is invoked for pages easyocr cannot read.
+        log.warning(
+            "[VISION LLM TRIGGERED] Pages local OCR cannot read will use vision model '%s'.",
+            cfg.vision_model,
+        )
 
     if args.list:
         for pdf in sorted(documents_dir.glob("*.pdf")):

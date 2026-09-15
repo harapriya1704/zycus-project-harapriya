@@ -448,6 +448,88 @@ def test_precision_ocr_failure_falls_through_to_vision(tmp_path: Path, monkeypat
     assert doc.pages[0].text == "VISION-TEXT"
 
 
+# ---------------------------------------------------------------------------
+# Manual Vision-LLM trigger (use_llm / --use-llm): default run is OCR-only
+# ---------------------------------------------------------------------------
+
+def test_default_run_leaves_unreadable_page_empty(tmp_path: Path, monkeypatch) -> None:
+    """Without the manual LLM trigger the Vision LLM never runs: an image-only
+    page that easyocr cannot read stays honest-empty (no raise, no tokens)."""
+    monkeypatch.setattr("src.extractor._local_ocr", lambda _image_path: None)
+    built: list[object] = []
+    monkeypatch.setattr("src.extractor._chain_for", lambda *a, **k: built.append(a) or None)
+
+    doc = Document(
+        path=tmp_path / "doc.pdf",
+        pages=[PdfPage(index=0, width_pt=100, height_pt=200, image_path=_png(tmp_path, "a.png"))],
+    )
+    extract_document_text(doc, chain=None, settings=_settings(), cache_dir=tmp_path / "cache")
+    assert built == []  # no vision chain built, even though require_vision=True
+    assert doc.pages[0].text == ""
+
+
+def test_credentials_alone_do_not_trigger_vision(tmp_path: Path, monkeypatch) -> None:
+    """A configured key never activates the Vision LLM by itself; only the
+    manual ``use_llm`` trigger does."""
+    monkeypatch.setattr("src.extractor._local_ocr", lambda _image_path: None)
+    built: list[object] = []
+    monkeypatch.setattr("src.extractor._chain_for", lambda *a, **k: built.append(a) or None)
+
+    doc = Document(
+        path=tmp_path / "doc.pdf",
+        pages=[PdfPage(index=0, width_pt=100, height_pt=200, image_path=_png(tmp_path, "a.png"))],
+    )
+    extract_document_text(
+        doc,
+        chain=None,
+        settings=_settings(hf_token="hf-test"),
+        cache_dir=tmp_path / "cache",
+    )
+    assert built == []  # key present but no --use-llm -> still fully local
+    assert doc.pages[0].text == ""
+
+
+def test_use_llm_trigger_routes_unreadable_pages_to_vision(tmp_path: Path, monkeypatch) -> None:
+    """With use_llm=True, pages easyocr cannot read are sent through the
+    Vision LLM (chain auto-built from the configured key)."""
+    vision_calls: list[int] = []
+    fake = RunnableLambda(lambda page: vision_calls.append(page.index) or "VISION-TEXT")
+    monkeypatch.setattr("src.extractor._local_ocr", lambda _image_path: None)
+    monkeypatch.setattr("src.extractor._chain_for", lambda *a, **k: fake)
+
+    doc = Document(
+        path=tmp_path / "doc.pdf",
+        pages=[PdfPage(index=0, width_pt=100, height_pt=200, image_path=_png(tmp_path, "a.png"))],
+    )
+    extract_document_text(
+        doc,
+        chain=None,
+        settings=_settings(use_llm=True, hf_token="hf-test"),
+        cache_dir=tmp_path / "cache",
+    )
+    assert vision_calls == [0]
+    assert doc.pages[0].text == "VISION-TEXT"
+
+
+def test_use_llm_without_credentials_raises_when_vision_required(tmp_path: Path, monkeypatch) -> None:
+    """Triggering the Vision LLM without a configured key surfaces honestly
+    (never silently returns empty for a page that needs vision)."""
+    monkeypatch.setattr("src.extractor._local_ocr", lambda _image_path: None)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    doc = Document(
+        path=tmp_path / "doc.pdf",
+        pages=[PdfPage(index=0, width_pt=100, height_pt=200, image_path=_png(tmp_path, "a.png"))],
+    )
+    with pytest.raises(RuntimeError, match="no vision chain/API key"):
+        extract_document_text(
+            doc,
+            chain=None,
+            settings=_settings(use_llm=True, hf_token="", llm_api_key=""),
+            cache_dir=tmp_path / "cache",
+        )
+
+
 def test_data_uri_compresses_page_to_downscaled_jpeg(tmp_path: Path) -> None:
     """Vision payloads are downscaled to <=1000px and JPEG-compressed instead
     of shipping full-resolution PNGs (4-5x smaller payloads)."""
