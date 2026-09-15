@@ -86,12 +86,12 @@ The pipeline is **provider-agnostic by construction**: every LLM — vision tran
 | Role | Default (shipped `.env`)            | On Groq                                | On Hugging Face                        |
 |------|-------------------------------------|----------------------------------------|----------------------------------------|
 | Vision (scan/image pages, opt-in) | `zai-org/GLM-4.5V` on HF | `INV_VISION_BASE_URL` = Groq | `INV_VISION_BASE_URL` = HF router (`INV_VISION_MODEL`) |
-| Text (structuring, validation, correction) | `qwen/qwen3.8-27b` on Groq | `INV_TEXT_BASE_URL` = Groq (`INV_TEXT_MODEL`) | `INV_TEXT_BASE_URL` = HF router (`INV_TEXT_MODEL`) |
+| Text (structuring, validation, correction) | `openai/gpt-oss-20b` on Groq | `INV_TEXT_BASE_URL` = Groq (`INV_TEXT_MODEL`) | `INV_TEXT_BASE_URL` = HF router (`INV_TEXT_MODEL`) |
 
 Key orchestration behaviour:
 
 - **Environment-driven, zero code changes.** `INV_VISION_BASE_URL`, `INV_TEXT_BASE_URL`, `INV_GROQ_BASE_URL`, `INV_VISION_MODEL`, `INV_TEXT_MODEL` — plus `HF_TOKEN` / `GROQ_API_KEY` — fully determine the deployed topology.
-- **Hybrid topology (the shipped default).** Vision on the **Hugging Face** router (`zai-org/GLM-4.5V`) and text reasoning on **Groq** (`qwen/qwen3.8-27b`). Vision is **opt-in** (`--use-llm` / `INV_USE_LLM=true`) — a plain `python run.py` never calls it, so the default run spends **zero** vision tokens.
+- **Hybrid topology (the shipped default).** Vision on the **Hugging Face** router (`zai-org/GLM-4.5V`) and text reasoning on **Groq** (`openai/gpt-oss-20b`). Vision is **opt-in** (`--use-llm` / `INV_USE_LLM=true`) — a plain `python run.py` never calls it, so the default run spends **zero** vision tokens.
 - **Full-HF topology.** Both vision and text reasoning ride the HF Serverless router, independent of Groq's per-model TPD/TPM quotas.
 - **Provider validation at startup.** Model availability is probed up front (see *Verification Tools* below) so a misconfigured/un-deployed model is caught before a long batch run begins.
 
@@ -201,17 +201,17 @@ cp .env.example .env
 # edit .env:
 #   GROQ_API_KEY=gsk_...                       # text reasoning (structuring, validation, correction)
 #   INV_TEXT_BASE_URL=https://api.groq.com/openai/v1
-#   INV_TEXT_MODEL=qwen/qwen3.8-27b
+#   INV_TEXT_MODEL=openai/gpt-oss-20b
 #   HF_TOKEN=hf_...                            # vision only — needed just for --use-llm / INV_USE_LLM=true
 #   INV_VISION_BASE_URL=https://router.huggingface.co/v1
 #   INV_VISION_MODEL=zai-org/GLM-4.5V
 #   INV_USE_LLM=false                          # vision is opt-in; a default run is fully local
 ```
 
-Defaults (current `.env`): text/structuring = **`qwen/qwen3.8-27b`** on **Groq**; vision (opt-in) = **`zai-org/GLM-4.5V`** on the **Hugging Face** router. If your gateway exposes different model ids — and keep the vision model *multimodal* — override per-run or in `.env`:
+Defaults (current `.env`): text/structuring = **`openai/gpt-oss-20b`** on **Groq**; vision (opt-in) = **`zai-org/GLM-4.5V`** on the **Hugging Face** router. If your gateway exposes different model ids — and keep the vision model *multimodal* — override per-run or in `.env`:
 
 ```bash
-export INV_TEXT_MODEL=qwen/qwen3.8-27b
+export INV_TEXT_MODEL=openai/gpt-oss-20b
 export INV_VISION_MODEL=zai-org/GLM-4.5V
 ```
 
@@ -308,6 +308,7 @@ without re-running the pipeline; clicking **Run Pipeline** regenerates it.
 | `app.py` | Streamlit dashboard: PDF viewer + ERP oracle audit + JSON/line-item tabs |
 | `run.py` | One-command runner (`--validate` enables the agent loop) |
 | `check_outputs.py` | ERP bridge: validated outputs → `erp_book` → MATCH/MISMATCH |
+| `src/config.py` | Runtime settings: `INV_*` env vars, LLM client factories, fast-mode routing |
 | `src/pdf_reader.py` | PDF ingest, text/image detection, rasterisation |
 | `src/extractor.py` | easyocr CPU OCR by default + opt-in Vision LLM transcription |
 | `src/schemas.py` | Pydantic models mirroring `AUTODRAFT_SCHEMA.md` |
@@ -316,6 +317,7 @@ without re-running the pipeline; clicking **Run Pipeline** regenerates it.
 | `src/validation.py` | Deterministic Validation Agent (master + ERP oracle) |
 | `src/agents.py` | Validation loop: proposer/validator/corrector, ≤`max_retries` |
 | `src/llm_retry.py` | Retry/back-off wrapper: 429 + TPM + transient-error handling |
+| `src/logging_conf.py` | Centralised logging (stdout + rotating file under `output/logs/`) |
 | `src/pipeline.py` | Per-file orchestration and `output/` writing |
 | `scripts/check_models.py` | Pre-flight provider health-check (HF Serverless + Groq probes) |
 | `scripts/benchmark.py` | Comparative latency/429/ERP benchmark across Full-HF / Hybrid / Full-Groq |
