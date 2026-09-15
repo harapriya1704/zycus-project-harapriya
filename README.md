@@ -79,18 +79,28 @@ The vision: an accounts-payable team approves exceptions instead of keying docum
 - **Corrector agent** — an LLM handed the proposed JSON *plus* the validation issues *plus* the raw document text; it repairs only flagged fields, never invents values. If a correction inference itself fails (timeout, malformed reply, schema rejection) the failure is contained as `CorrectorFailure`: the flawed **proposal is kept** and the loop stops — the document is never lost and a broken corrector cannot burn the retry budget.
 - **The loop** iterates propose → validate → correct until no ERROR-grade issues remain or `max_retries` (default 3) is hit — **guaranteed termination**.
 
-### Why open-weight models via Groq
+### Multi-provider LLM orchestration
 
-All agent LLMs run against an **OpenAI-compatible endpoint driven by `OPENAI_API_KEY` / `OPENAI_BASE_URL`**, with **two-tier model routing**:
-- **Vision** (image-only/scan pages) → **`qwen/qwen3.8-27b`** (multimodal; required because it accepts `image_url`/base64 payloads),
-- **Text** (structuring, validation, correction) → **`openai/gpt-oss-120b`** (text-only).
+The pipeline is **provider-agnostic by construction**: every LLM — vision transcription *and* text reasoning — is built by `Settings.get_vision_llm()` / `Settings.get_text_llm()`, which resolve the endpoint, credential, and model purely from environment variables. Nothing is hard-coded to a single vendor; the same binary switches between **Hugging Face Serverless Inference** (`https://router.huggingface.co/v1`) and **Groq** (`https://api.groq.com/openai/v1`) by editing `.env`.
+
+| Role | Production default                | `HF_TOKEN` route                      | `GROQ_API_KEY` route         |
+|------|-----------------------------------|---------------------------------------|------------------------------|
+| Vision (scan/image pages) | `zai-org/GLM-4.5V` | `INV_VISION_BASE_URL` = HF router | `INV_VISION_BASE_URL` = Groq |
+| Text (structuring, validation, correction) | `meta-llama/Llama-3.3-70B-Instruct` | `INV_TEXT_BASE_URL` = HF router (`INV_TEXT_MODEL`) | `text_base_url` empty → `groq_base_url` (`INV_TEXT_MODEL`) |
+
+Key orchestration behaviour:
+
+- **Environment-driven, zero code changes.** `INV_VISION_BASE_URL`, `INV_TEXT_BASE_URL`, `INV_GROQ_BASE_URL`, `INV_VISION_MODEL`, `INV_TEXT_MODEL` — plus `HF_TOKEN` / `GROQ_API_KEY` — fully determine the deployed topology.
+- **Full-HF topology (recommended).** Both vision and text reasoning ride the HF Serverless router: the whole pipeline becomes *independent of Groq's daily TPD/TPM quotas* — the #1 source of HTTP 429 stalls.
+- **Hybrid topology.** GLM-4.5V vision on HF + gpt-oss-120b text on Groq for maximum throughput on the fastest text inference.
+- **Provider validation at startup.** Model availability is probed up front (see *Verification Tools* below) so a misconfigured/un-deployed model is caught before a long batch run begins.
 
 Rationale:
 
-- **Speed.** Groq's LPU inference serves GPT-OSS 120B at hundreds of tokens/second — a full document runs in seconds, not minutes.
-- **Cost & sovereignty.** Open-weight models run cheaply and can be self-hosted; there is no per-token price lock-in or data-residency constraint inherent to closed APIs.
+- **Speed.** Open-weight models (Llama-3.3-70B, GPT-OSS-120B, GLM-4.5V) serve full documents in seconds on either LPU (Groq) or Serverless (HF) inference.
+- **Cost & sovereignty.** Open weights run cheaply and can be self-hosted; no per-token price lock-in or data-residency constraint inherent to closed APIs.
 - **Accuracy where it matters.** Validation is deterministic (master-data cross-reference + ERP oracle), so the *entire* loop converges exactly — the LLM is only the extraction/correction actor, not the source of truth.
-- **Portability.** The provider is swappable: changing `OPENAI_BASE_URL` + `INV_VISION_MODEL`/`INV_STRUCTURING_MODEL` re-points the whole pipeline without code changes.
+- **Portability.** Swapping `INV_VISION_BASE_URL` / `INV_TEXT_BASE_URL` + the model vars re-points the whole pipeline without a single code change.
 
 ---
 
@@ -129,6 +139,32 @@ and operators — rate limits, timeouts, partial disk writes, and UI hangs inclu
    rasterisation is memoised with `@st.cache_data` keyed on file content + DPI, errors
    are surfaced in a collapsible expander, and per-PDF results are isolated in session
    state so switching documents never shows stale data.
+
+5. **Fail-fast stall prevention (`src/config.py` + `src/llm_retry.py`).** A single
+   LLM call is budgeted by `INV_LLM_ATTEMPTS` (default **1** = fail fast) and any retry
+   wait is hard-capped by `INV_LLM_MAX_WAIT` (**60 s**): a provider throttle that would
+   force a multi-hundred-second `Retry-After` sleep raises `BenchmarkTimeoutException`
+   instead of freezing the process. A large batch therefore degrades an affected file
+   to an honest `declined` entry and moves on — the pipeline **never hangs** on a
+   congested provider, even when quotas are exhausted.
+
+6. **Production token budgeting (text reasoning).** Text-reasoning calls
+   (`src/config.py: text_max_tokens`) request an explicit **4096-token** generation
+   window — instead of trusting a serverless endpoint's low default cap — so a complex
+   multi-page invoice's full payables JSON (supplier, buyer, payment terms, line items,
+   taxes, totals) completes **without mid-payload truncation**. The structured output
+   is still enforced through the Pydantic `FileOutput` schema, so a wider window never
+   compromises strict schema compliance (malformed replies are rejected, not repaired).
+
+7. **Automated verification & benchmarking (`scripts/`).**
+   - `scripts/check_models.py` — pre-flight health check: probes every candidate
+     vision/text model against HF Serverless and Groq, and prints which providers are
+     actually deployable on the current account.
+   - `scripts/benchmark.py` — comparative performance harness: runs `run.py --validate`
+     on representative invoices across the Full-HF / Hybrid / Full-Groq topologies with
+     a *fresh* cache each time, then reports wall-clock latency, HTTP 429 /
+     rate-limit events, `BenchmarkTimeoutException` aborts, and ERP recompute accuracy
+     against the grader's oracle.
 
 ---
 
@@ -200,8 +236,20 @@ python check_outputs.py            # or: python check_outputs.py output/INV-31.j
 ### 6. Test & lint
 
 ```bash
-python -m pytest tests -q          # 104+ tests, no API key required
-python -m ruff check src tests run.py erp.py example_check.py check_outputs.py app.py
+python -m pytest tests -q          # unit/integration tests, no API key required
+python -m ruff check src tests scripts run.py erp.py example_check.py check_outputs.py app.py
+```
+
+### 6b. Provider health-check & benchmark tools
+
+```bash
+# Pre-flight: probe vision/text models on HF Serverless + Groq, print deployable configs
+python scripts/check_models.py
+
+# Comparative performance harness: Full-HF / Hybrid / Full-Groq latency,
+# rate-limit events, and ERP accuracy (defaults to all architectures)
+python scripts/benchmark.py
+python scripts/benchmark.py --arch full-hf hybrid
 ```
 
 ### 7. Streamlit dashboard
@@ -245,6 +293,8 @@ without re-running the pipeline; clicking **Run Pipeline** regenerates it.
 | `src/agents.py` | Validation loop: proposer/validator/corrector, ≤`max_retries` |
 | `src/llm_retry.py` | Retry/back-off wrapper: 429 + TPM + transient-error handling |
 | `src/pipeline.py` | Per-file orchestration and `output/` writing |
+| `scripts/check_models.py` | Pre-flight provider health-check (HF Serverless + Groq probes) |
+| `scripts/benchmark.py` | Comparative latency/429/ERP benchmark across Full-HF / Hybrid / Full-Groq |
 | `tests/` | 104+ unit + integration tests (schema, matching, loop, ERP bridge, retries) |
 | `erp.py` | The ERP recompute oracle (fixed; graded as-is) |
 

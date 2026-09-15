@@ -5,7 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from langchain_core.runnables import RunnableLambda
-from src.formatter import build_autodraft_chain, format_autodraft, resolve_codes
+from src.formatter import (
+    MAX_STRUCTURING_CHARS,
+    build_autodraft_chain,
+    format_autodraft,
+    resolve_codes,
+)
 from src.master_data import MasterData
 from src.schemas import Autodraft, Declined, FileOutput
 
@@ -53,8 +58,31 @@ def test_unknown_supplier_stays_blank() -> None:
     llm_out = FileOutput(
         payables=[Autodraft(invoice_number="1", supplier={"name": "Acme Neverland"})]
     )
-    result = resolve_codes(llm_out, MasterData.load(REPO_ROOT / "master_data"), document_text="Acme Neverland")
+    result = resolve_codes(
+        llm_out, MasterData.load(REPO_ROOT / "master_data"), document_text="Acme Neverland"
+    )
     assert result.payables[0].supplier.supplier_id == ""
+
+
+def test_oversized_transcript_truncated_to_structuring_cap() -> None:
+    captured: dict[str, str] = {}
+
+    def _probe(payload):
+        captured["document_text"] = payload["document_text"]
+        return FileOutput()
+
+    long_text = "A" * (MAX_STRUCTURING_CHARS * 2)
+    result = format_autodraft(
+        document_text=long_text,
+        filename="BIG.pdf",
+        chain=RunnableLambda(_probe),
+        master=MasterData(),
+    )
+    # The LLM only ever sees the truncated window...
+    assert len(captured["document_text"]) == MAX_STRUCTURING_CHARS
+    assert captured["document_text"] == "A" * MAX_STRUCTURING_CHARS
+    # ...while the deterministic resolver still receives the full transcript.
+    assert result.file == "BIG.pdf"
 
 
 def test_tax_type_code_resolved() -> None:
@@ -76,11 +104,20 @@ def test_tax_type_code_resolved() -> None:
     assert result.payables[0].taxes[0].tax_type_code == "DE_000_RC"
 
 
-def test_build_chain_requires_api_key(monkeypatch) -> None:
+def test_build_chain_requires_api_key(monkeypatch, tmp_path) -> None:
 
     import pytest
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_ORG_ID", raising=False)
+
+    from src.config import Settings
+
+    # Build a keyless settings object and force the singleton to return it, so
+    # the credentials present in .env cannot leak into this hermetic test.
+    def _keyless() -> Settings:
+        return Settings(groq_api_key="", hf_token="", llm_api_key="", llm_base_url="")
+
+    monkeypatch.setattr("src.formatter.get_settings", _keyless)
     with pytest.raises(RuntimeError, match="credentials"):
         build_autodraft_chain(model="gpt-4o-mini", settings=None)

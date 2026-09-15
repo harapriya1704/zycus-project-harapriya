@@ -16,6 +16,7 @@ fields it omitted fall back to their schema defaults.
 from __future__ import annotations
 
 import json
+import time
 import typing
 from functools import lru_cache
 
@@ -32,6 +33,14 @@ from src.master_data import MasterData
 from src.schemas import Autodraft, Declined, FileOutput
 
 log = get_logger(__name__)
+
+#: Upper bound on the document text sent to the structuring LLM (precision
+#: mode). Full-page OCR/Vision transcripts routinely exceed 20 K chars on
+#: multi-page invoices; truncating to 8000 keeps the prompt well under Groq's
+#: per-minute token budget while still covering header + line-item regions.
+#: Deterministic code resolution still sees the full text (``format_autodraft``
+#: truncates only ``text_for_llm``, never ``document_text``).
+MAX_STRUCTURING_CHARS = 8000
 
 #: System prompt for the structuring chain. Every rule the grader enforces is
 #: stated here; anything not on the document must stay empty.
@@ -130,12 +139,17 @@ def build_autodraft_chain(
 ) -> Runnable:
     """Build the LangChain runnable: document text -> :class:`FileOutput`.
 
+    The model is created by :meth:`Settings.get_text_llm` — a ``ChatOpenAI``
+    wired to Groq (``GROQ_API_KEY``), so all text reasoning stays on Groq
+    while image transcription runs on the Hugging Face Serverless router.
+
     The model is wired to the Pydantic :class:`FileOutput` schema via
     ``with_structured_output``, so the response is validated strictly (no
     drifting keys or wrong types) before any downstream code sees it.
 
     Args:
-        model: chat model name; defaults to ``INV_STRUCTURING_MODEL``.
+        model: chat model name; defaults to ``INV_TEXT_MODEL`` (via
+            :meth:`Settings.effective_structuring_model`).
         temperature: sampling temperature; defaults to the configured value.
         settings: settings source; defaults to the process singleton.
         fast_mode: use the streamlined fast-mode system prompt (half the
@@ -146,26 +160,19 @@ def build_autodraft_chain(
         validated :class:`FileOutput`.
 
     Raises:
-        RuntimeError: when no API key is configured.
+        RuntimeError: when no Groq API key is configured.
     """
     cfg = settings or get_settings()
-    model_name = model or cfg.structuring_model
+    model_name = model or cfg.effective_structuring_model()
     temp = cfg.structuring_temperature if temperature is None else temperature
 
     try:
-        llm = ChatOpenAI(
-            model=model_name,
-            temperature=temp,
-            base_url=cfg.provider_base_url(),
-            api_key=cfg.provider_api_key(),
-            max_tokens=cfg.effective_max_tokens(),
-            timeout=cfg.llm_timeout,
-        )
-    except Exception as exc:  # typically a missing OPENAI_API_KEY
+        llm = cfg.get_text_llm(model=model_name, temperature=temp)
+    except Exception as exc:  # pragma: no cover - credentials are checked up-front
         log.error("ChatOpenAI construction failed: %s (%s)", type(exc).__name__, exc)
         raise RuntimeError(
-            "Cannot build the structuring chain: no usable OpenAI credentials "
-            "configured (set OPENAI_API_KEY)."
+            "Cannot build the structuring chain: no usable Groq credentials "
+            "configured (set GROQ_API_KEY)."
         ) from exc
 
     # The system prompt is passed as a *fixed* SystemMessage (not a template):
@@ -180,16 +187,27 @@ def build_autodraft_chain(
         ]
     )
 
-    chain: Runnable = prompt | _ask(llm) | _finalize(FileOutput)
+    chain: Runnable = prompt | _ask(llm, settings=settings) | _finalize(FileOutput)
     return chain
 
 
-def _ask(llm: ChatOpenAI) -> Runnable:
-    """Runnable mapping a message list to the model's (string) reply."""
+def _ask(llm: ChatOpenAI, settings: Settings | None = None) -> Runnable:
+    """Runnable mapping a message list to the model's (string) reply.
+
+    Retry behaviour (budget and per-wait ceiling) follows the caller's
+    :class:`Settings` rather than the module defaults, so a benchmark can force
+    ``max_attempts=1`` / a 60 s wait cap and fail fast on a throttled provider.
+    """
 
     def _invoke(messages) -> str:
+        cfg = settings or get_settings()
         try:
-            response = invoke_with_retry(llm, messages)
+            response = invoke_with_retry(
+                llm,
+                messages,
+                max_attempts=cfg.llm_retry_attempts,
+                max_wait=cfg.llm_max_wait,
+            )
         except Exception as exc:  # noqa: BLE001 - surface the raw provider error
             log.error("Structuring LLM call failed: %s", describe_error(exc))
             raise
@@ -260,7 +278,11 @@ def _strip_extra(
             item_anns = typing.get_args(ann) if typing.get_origin(ann) is list else (ann,)
             item_ann = item_anns[0] if item_anns else ann
             return [_clean(v, item_ann) for v in value]
-        if isinstance(value, dict) and isinstance(ann, type) and issubclass(ann, pydantic.BaseModel):
+        if (
+            isinstance(value, dict)
+            and isinstance(ann, type)
+            and issubclass(ann, pydantic.BaseModel)
+        ):
             keep = {}
             for key, item in value.items():
                 if key not in ann.model_fields:
@@ -305,9 +327,7 @@ def _finalize(schema: type[pydantic.BaseModel]) -> Runnable:
 @lru_cache(maxsize=8)
 def _chain_for(model: str, temperature: float, fast_mode: bool) -> Runnable:
     """Cached structuring chain per (model, temperature, fast mode)."""
-    return build_autodraft_chain(
-        model=model, temperature=temperature, fast_mode=fast_mode
-    )
+    return build_autodraft_chain(model=model, temperature=temperature, fast_mode=fast_mode)
 
 
 def _structuring_chain(settings: Settings | None = None) -> Runnable:
@@ -317,9 +337,7 @@ def _structuring_chain(settings: Settings | None = None) -> Runnable:
     mode uses the configured heavy model and the full system prompt.
     """
     cfg = settings or get_settings()
-    return _chain_for(
-        cfg.effective_structuring_model(), cfg.structuring_temperature, cfg.fast_mode
-    )
+    return _chain_for(cfg.effective_structuring_model(), cfg.structuring_temperature, cfg.fast_mode)
 
 
 def resolve_codes(
@@ -423,19 +441,35 @@ def format_autodraft(
         return result
 
     effective_chain = chain or _structuring_chain(cfg)
+    struct_model = cfg.effective_structuring_model() if chain is None else "override-chain"
 
-    # Token budget in fast mode: only the first ``fast_max_input_chars`` chars
-    # reach the LLM. Deterministic code resolution still sees the full text, so
-    # master matching is unaffected.
+    # Token budget: fast mode caps the input at ``fast_max_input_chars``
+    # (default 3000); precision mode truncates oversized multi-page transcripts
+    # to ``MAX_STRUCTURING_CHARS`` (8000). Deterministic code resolution still
+    # sees the full text, so master matching is unaffected.
     cap = cfg.effective_max_input_chars()
     text_for_llm = document_text if cap <= 0 else document_text[:cap]
+    if len(text_for_llm) > MAX_STRUCTURING_CHARS:
+        text_for_llm = text_for_llm[:MAX_STRUCTURING_CHARS]
+        log.info(
+            "%s: truncated structuring input to %s chars (was %s)",
+            filename,
+            MAX_STRUCTURING_CHARS,
+            len(document_text),
+        )
     log.info(
         "%s: structuring %s chars of text (budget %s)",
         filename,
         len(text_for_llm),
         cap or "unlimited",
     )
+    _struct_start = time.perf_counter()
     result: FileOutput = effective_chain.invoke({"document_text": text_for_llm})
+    log.info(
+        "[Text Groq] Schema formatted in %.2fs (model %s)",
+        time.perf_counter() - _struct_start,
+        struct_model,
+    )
     result.file = filename
 
     effective_master = master if master is not None else MasterData.load_default(settings=cfg)

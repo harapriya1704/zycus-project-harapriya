@@ -35,11 +35,27 @@ except ImportError:  # pragma: no cover - provider SDKs are optional dependencie
 
 log = get_logger(__name__)
 
+
+class BenchmarkTimeoutException(RuntimeError):
+    """Raised to fail fast instead of sleeping through a provider back-off.
+
+    Triggers when a retry would have to wait longer than ``max_wait`` (a
+    multi-hundred-second ``Retry-After`` header, an unbounded TPM window, ...).
+    During the model benchmark a hang is far worse than a failed call, so the
+    guard raises and lets the harness move on to the next candidate instead of
+    blocking the pipeline for minutes.
+    """
+
+
 #: Total call attempts made by default (first call + retries). 10 attempts give
 #: long Groq TPM/RPM sliding windows several full back-off cycles to clear.
 DEFAULT_MAX_ATTEMPTS = 10
 #: Seconds to wait before the first retry.
 BASE_DELAY = 1.0
+#: Default ceiling (seconds) for any single retry wait: retries that would
+#: sleep longer than this are refused so a throttled provider can never stall
+#: a benchmark/UI run (e.g. a 300 s Groq ``Retry-After`` header).
+DEFAULT_MAX_WAIT = 60.0
 #: Upper bound for the exponential back-off delay (seconds).
 MAX_DELAY = 60.0
 #: Wait used for per-minute token (TPM) limits — one full window.
@@ -47,6 +63,9 @@ TOKEN_RESET_DELAY = 60.0
 #: Ceiling (seconds) applied to a provider-sent ``Retry-After`` value, so a
 #: malformed/gigantic header can never stall the batch indefinitely.
 MAX_RETRY_AFTER = 300.0
+#: Interval (seconds) between live countdown log lines during a long wait, so
+#: operators can see the back-off still ticking without spamming the log.
+COUNTDOWN_INTERVAL = 30.0
 #: Non-429 HTTP statuses that are still transient enough to retry.
 _TRANSIENT_STATUS = {408, 409, 425}
 #: How deep nested ``__cause__`` / ``__context__`` chains are unwrapped before
@@ -216,11 +235,29 @@ def describe_error(exc: BaseException) -> str:
     return detail
 
 
+def _sleep_with_countdown(seconds: float, *, what: str) -> None:
+    """Sleep ``seconds``, logging a live countdown instead of blocking silently.
+
+    For long rate-limit pauses (Groq TPM/RPM windows) this emits one log line
+    up-front plus a ``COUNTDOWN_INTERVAL`` update so the batch is never mistaken
+    for a hung process. ``what`` describes the wait (e.g. "TPM window reset").
+    """
+    log.warning("Waiting %.0fs %s ...", seconds, what)
+    remaining = seconds
+    while remaining > COUNTDOWN_INTERVAL:
+        time.sleep(COUNTDOWN_INTERVAL)
+        remaining -= COUNTDOWN_INTERVAL
+        log.warning("  %-8s %.0fs remaining (%s)", what, remaining, time.strftime("%H:%M:%S"))
+    if remaining > 0:
+        time.sleep(remaining)
+
+
 def invoke_with_retry(
     llm: Any,
     messages: Any,
     *,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_wait: float = DEFAULT_MAX_WAIT,
     base_delay: float = BASE_DELAY,
     max_delay: float = MAX_DELAY,
     token_reset_delay: float = TOKEN_RESET_DELAY,
@@ -239,6 +276,10 @@ def invoke_with_retry(
       back-off. Nested ``__cause__`` chains are inspected so raw HTTPX status
       errors wrapped inside LangChain do not escape.
 
+    Any wait longer than ``max_wait`` raises :class:`BenchmarkTimeoutException`
+    instead of sleeping: deep Throttle/``Retry-After`` stalls fail fast so a
+    benchmark (or an interactive run) is never blocked for minutes.
+
     Non-retryable exceptions (auth failures, malformed requests) are re-raised
     immediately so genuine problems still surface fast.
 
@@ -246,6 +287,8 @@ def invoke_with_retry(
         llm: a LangChain-compatible chat model exposing ``.invoke(messages)``.
         messages: the message payload to send.
         max_attempts: total call budget (first attempt included).
+        max_wait: ceiling (seconds) for any single retry wait; retries that
+            would exceed it raise :class:`BenchmarkTimeoutException`.
         base_delay: seconds to wait before the first 429 retry (grows
             geometrically with each retry).
         max_delay: ceiling for the growing back-off delay.
@@ -255,6 +298,8 @@ def invoke_with_retry(
         The raw result of ``llm.invoke(messages)``.
 
     Raises:
+        BenchmarkTimeoutException: when the retry would sleep for more than
+            ``max_wait`` seconds.
         The original exception when the retry budget is exhausted or when the
         error is not retryable.
     """
@@ -277,6 +322,9 @@ def invoke_with_retry(
             retry_after = _retry_after_seconds(exc)
             if retry_after is not None:
                 sleep_for = retry_after
+                what = "for Groq TPM window reset"
+                if token_limit or _is_rate_limit(exc):
+                    log.warning("Groq TPM limit reached. Pacing request...")
                 log.warning(
                     "Transient LLM error, attempt %s/%s; Retry-After header "
                     "says %.0fs, waiting ...",
@@ -286,6 +334,8 @@ def invoke_with_retry(
                 )
             elif token_limit:
                 sleep_for = token_reset_delay
+                what = "for TPM window reset"
+                log.warning("Groq TPM limit reached. Pacing request...")
                 log.warning(
                     "Token-per-minute (TPM) limit on LLM call, attempt %s/%s; "
                     "waiting %.0fs for the window to reset ...",
@@ -296,12 +346,17 @@ def invoke_with_retry(
             else:
                 exponential = base_delay * (2 ** (attempt - 1))
                 sleep_for = min(exponential + random.uniform(0, exponential * 0.25), max_delay)
+                what = "retrying after transient error"
                 log.warning(
-                    "Transient LLM error, attempt %s/%s; "
-                    "retrying in %.2fs ...",
+                    "Transient LLM error, attempt %s/%s; retrying in %.2fs ...",
                     attempt,
                     max_attempts,
                     sleep_for,
                 )
-            time.sleep(sleep_for)
+            if sleep_for > max_wait:
+                raise BenchmarkTimeoutException(
+                    f"provider throttle asks for a {sleep_for:.0f}s wait (cap {max_wait:.0f}s); "
+                    f"refusing to stall the pipeline: {type(exc).__name__}: {exc}"
+                ) from exc
+            _sleep_with_countdown(sleep_for, what=what)
     raise AssertionError("unreachable")

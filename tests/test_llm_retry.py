@@ -5,7 +5,12 @@ from __future__ import annotations
 import httpx
 import openai
 import pytest
-from src.llm_retry import _retry_after_seconds, describe_error, invoke_with_retry
+from src.llm_retry import (
+    _retry_after_seconds,
+    _sleep_with_countdown,
+    describe_error,
+    invoke_with_retry,
+)
 
 
 class _RateLimit(Exception):
@@ -24,6 +29,14 @@ class _Bursty:
         if self.calls <= self.failures:
             raise _RateLimit("slow down")
         return "ok"
+
+
+def test_sleep_with_countdown_splits_long_waits(monkeypatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.llm_retry.time.sleep", lambda s: sleeps.append(s))
+    _sleep_with_countdown(65.0, what="for TPM window reset")
+    # 30s tick + 30s tick + 5s remainder, never blocking silently.
+    assert sleeps == [30.0, 30.0, 5.0]
 
 
 def test_success_on_first_call(monkeypatch) -> None:
@@ -82,6 +95,36 @@ class _TokenLimit(_WithBody):
     status_code = 413
 
 
+def test_rate_limit_429_with_retry_after_emits_groq_pacing_warning(monkeypatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.llm_retry.time.sleep", lambda s: sleeps.append(s))
+    warnings_seen: list[str] = []
+
+    class _Log:
+        def warning(self, message, *args) -> None:
+            warnings_seen.append(str(message))
+
+        def error(self, message, *args) -> None:
+            warnings_seen.append(str(message))
+
+    monkeypatch.setattr("src.llm_retry.log", _Log())
+
+    # Groq 429s carry a Retry-After header but no "tokens per minute" marker,
+    # so _is_token_limit() is False here; the rate-limit path must still
+    # surface the explicit pacing warning.
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    exc = httpx.HTTPStatusError(
+        "Client error '429 Too Many Requests'",
+        request=request,
+        response=_httpx_response(429, {"retry-after": "30"}),
+    )
+    llm = _bursty_once(exc)
+    assert invoke_with_retry(llm, ["hi"], max_attempts=3) == "ok"
+    assert llm.calls == 2
+    assert sleeps == [30.0]
+    assert any("Groq TPM limit reached. Pacing request..." in line for line in warnings_seen)
+
+
 def test_token_limit_retried_with_fixed_wait(monkeypatch) -> None:
     sleeps: list[float] = []
     monkeypatch.setattr("src.llm_retry.time.sleep", lambda s: sleeps.append(s))
@@ -95,14 +138,21 @@ def test_token_limit_retried_with_fixed_wait(monkeypatch) -> None:
             if self.calls == 1:
                 raise _TokenLimit(
                     "Request too large",
-                    {"error": {"code": "rate_limit_exceeded", "message": "tokens per minute (TPM)"}},
+                    {
+                        "error": {
+                            "code": "rate_limit_exceeded",
+                            "message": "tokens per minute (TPM)",
+                        }
+                    },
                 )
             return "ok"
 
     llm = _Bursty()
     assert invoke_with_retry(llm, ["hi"], token_reset_delay=60.0) == "ok"
     assert llm.calls == 2
-    assert sleeps == [60.0]
+    # The live countdown splits the 60s window into 30s ticks and re-sleeps the
+    # remainder, so the total still equals token_reset_delay.
+    assert sum(sleeps) == 60.0
 
 
 def test_describe_error_includes_response_body() -> None:
@@ -214,13 +264,19 @@ def test_retry_after_seconds_ignores_non_numeric_and_caps() -> None:
     req = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
     assert (
         _retry_after_seconds(
-            httpx.HTTPStatusError("429", request=req, response=_httpx_response(429, {"retry-after": "Fri, 31 Dec 2049"})),
+            httpx.HTTPStatusError(
+                "429",
+                request=req,
+                response=_httpx_response(429, {"retry-after": "Fri, 31 Dec 2049"}),
+            ),
             cap=300.0,
         )
         is None
     )
     capped = _retry_after_seconds(
-        httpx.HTTPStatusError("429", request=req, response=_httpx_response(429, {"retry-after": "9000"})),
+        httpx.HTTPStatusError(
+            "429", request=req, response=_httpx_response(429, {"retry-after": "9000"})
+        ),
         cap=300.0,
     )
     assert capped == 300.0

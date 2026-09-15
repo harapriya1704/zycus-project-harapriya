@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import pytest
 from langchain_core.runnables import RunnableLambda
 from src.config import Settings
 from src.extractor import (
+    _data_uri,
     _image_fingerprint,
     extract_document_text,
     read_transcription,
@@ -93,7 +95,7 @@ def test_pacing_sleeps_between_vision_calls(tmp_path: Path, monkeypatch) -> None
             PdfPage(index=1, width_pt=100, height_pt=200, image_path=_png(tmp_path, "b.png")),
         ],
     )
-    extract_document_text(doc, chain=fake, settings=_settings(vision_pacing_delay=2.5), cache_dir=tmp_path)
+    extract_document_text(doc, chain=fake, settings=_settings(vision_pacing_delay=2.5, vision_batch_pause=0.0), cache_dir=tmp_path)
     assert sleeps == [2.5]  # one wait between the two vision calls, not before the first
     assert [p.text for p in doc.pages] == ["OCR of 0", "OCR of 1"]
 
@@ -123,7 +125,7 @@ def test_no_pacing_when_delay_disabled(tmp_path: Path, monkeypatch) -> None:
             PdfPage(index=1, width_pt=100, height_pt=200, image_path=_png(tmp_path, "b.png")),
         ],
     )
-    extract_document_text(doc, chain=fake, settings=_settings(vision_pacing_delay=0.0), cache_dir=tmp_path)
+    extract_document_text(doc, chain=fake, settings=_settings(vision_pacing_delay=0.0, vision_batch_pause=0.0), cache_dir=tmp_path)
     assert sleeps == []
 
 
@@ -141,7 +143,7 @@ def test_pacing_ignores_text_layer_pages(tmp_path: Path, monkeypatch) -> None:
             PdfPage(index=3, width_pt=100, height_pt=200, image_path=_png(tmp_path, "b.png")),
         ],
     )
-    extract_document_text(doc, chain=fake, settings=_settings(vision_pacing_delay=2.0), cache_dir=tmp_path)
+    extract_document_text(doc, chain=fake, settings=_settings(vision_pacing_delay=2.0, vision_batch_pause=0.0), cache_dir=tmp_path)
     assert sleeps == [2.0]  # only the gap between the two vision calls is paced
     assert [p.text for p in doc.pages] == ["embedded 1", "OCR text", "embedded 2", "OCR text"]
 
@@ -227,10 +229,261 @@ def test_cache_hit_skips_pacing_between_vision_calls(tmp_path: Path, monkeypatch
         ],
     )
     cache_dir = tmp_path / "cache"
-    extract_document_text(doc, chain=fake, settings=_settings(vision_pacing_delay=2.0), cache_dir=cache_dir)
+    extract_document_text(doc, chain=fake, settings=_settings(vision_pacing_delay=2.0, vision_batch_pause=0.0), cache_dir=cache_dir)
     assert sleeps == [2.0]
 
     # Both pages already cached -> no API calls -> no pacing sleeps at all.
     sleeps.clear()
-    extract_document_text(doc, chain=fake, settings=_settings(vision_pacing_delay=2.0), cache_dir=cache_dir)
+    extract_document_text(doc, chain=fake, settings=_settings(vision_pacing_delay=2.0, vision_batch_pause=0.0), cache_dir=cache_dir)
     assert sleeps == []
+
+
+# ---------------------------------------------------------------------------
+# Batched vision processing + blank-page skipping (precision mode)
+# ---------------------------------------------------------------------------
+
+def test_batch_pause_applied_between_batches(tmp_path: Path, monkeypatch) -> None:
+    """Vision calls are grouped in batches; a batch pause is inserted at
+    batch boundaries on top of the per-page pacing."""
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.extractor.time.sleep", lambda s: sleeps.append(s))
+    fake = RunnableLambda(lambda page: f"OCR {page.index}")
+
+    pages = [
+        PdfPage(index=i, width_pt=100, height_pt=200, image_path=_png(tmp_path, f"p{i}.png"))
+        for i in range(4)
+    ]
+    doc = Document(path=tmp_path / "doc.pdf", pages=pages)
+    extract_document_text(
+        doc,
+        chain=fake,
+        settings=_settings(vision_pacing_delay=2.0, vision_batch_size=2, vision_batch_pause=1.0),
+        cache_dir=tmp_path / "cache",
+    )
+    assert [p.text for p in doc.pages] == [f"OCR {i}" for i in range(4)]
+    # 4 calls: per-page pacing before calls 2..4 (3 x 2.0) plus a 1.0 batch
+    # pause before call 3 (the start of batch 2).
+    assert sleeps == [2.0, 1.0, 2.0, 2.0]
+
+
+def test_pacing_unchanged_when_batch_pause_disabled(tmp_path: Path, monkeypatch) -> None:
+    """Disabling the batch pause preserves plain per-page pacing."""
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.extractor.time.sleep", lambda s: sleeps.append(s))
+    fake = RunnableLambda(lambda page: "OCR")
+
+    pages = [
+        PdfPage(index=i, width_pt=100, height_pt=200, image_path=_png(tmp_path, f"p{i}.png"))
+        for i in range(3)
+    ]
+    doc = Document(path=tmp_path / "doc.pdf", pages=pages)
+    extract_document_text(
+        doc,
+        chain=fake,
+        settings=_settings(vision_pacing_delay=2.0, vision_batch_size=2, vision_batch_pause=0.0),
+        cache_dir=tmp_path / "cache",
+    )
+    assert sleeps == [2.0, 2.0]
+
+
+def test_default_pacing_applies_batch_pause_per_page(tmp_path: Path, monkeypatch) -> None:
+    """With the default single-page batch, the 2s batch pause separates every
+    page request (pacing applies between consecutive pages too)."""
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.extractor.time.sleep", lambda s: sleeps.append(s))
+    fake = RunnableLambda(lambda page: "OCR")
+
+    pages = [
+        PdfPage(index=i, width_pt=100, height_pt=200, image_path=_png(tmp_path, f"p{i}.png"))
+        for i in range(3)
+    ]
+    doc = Document(path=tmp_path / "doc.pdf", pages=pages)
+    extract_document_text(
+        doc,
+        chain=fake,
+        settings=_settings(vision_pacing_delay=2.0),
+        cache_dir=tmp_path / "cache",
+    )
+    # Batch pause (2.0, default) fires at every batch boundary, i.e. before
+    # every call after the first, then per-page pacing (2.0) adds on top.
+    assert sleeps == [2.0, 2.0, 2.0, 2.0]
+
+
+def test_blank_page_skips_vision_call(tmp_path: Path) -> None:
+    """A near-blank scanned page must not spend vision tokens."""
+    pytest.importorskip("PIL")
+    import PIL.Image
+
+    blank = tmp_path / "blank.png"
+    PIL.Image.new("L", (200, 300), 255).save(blank)  # all white
+
+    calls: list[int] = []
+    fake = RunnableLambda(lambda page: calls.append(page.index) or "CONTENT")
+
+    doc = Document(
+        path=tmp_path / "doc.pdf",
+        pages=[PdfPage(index=0, width_pt=100, height_pt=200, image_path=blank)],
+    )
+    extract_document_text(doc, chain=fake, settings=_settings(), cache_dir=tmp_path / "cache")
+    assert calls == []  # vision chain never invoked for a blank page
+    assert doc.pages[0].text == ""
+
+
+def test_blank_skip_disable_forces_vision_on_blank_page(tmp_path: Path) -> None:
+    """When blank-page skipping is disabled, even a blank page goes to vision."""
+    pytest.importorskip("PIL")
+    import PIL.Image
+
+    blank = tmp_path / "blank.png"
+    PIL.Image.new("L", (200, 300), 255).save(blank)
+
+    kinds: list[str] = []
+    fake = RunnableLambda(lambda page: kinds.append("vision") or "CONTENT")
+
+    doc = Document(
+        path=tmp_path / "doc.pdf",
+        pages=[PdfPage(index=0, width_pt=100, height_pt=200, image_path=blank)],
+    )
+    extract_document_text(
+        doc,
+        chain=fake,
+        settings=_settings(vision_skip_blank_pages=False),
+        cache_dir=tmp_path / "cache",
+    )
+    assert kinds == ["vision"]
+    assert doc.pages[0].text == "CONTENT"
+
+
+def test_non_blank_page_still_transcribed(tmp_path: Path) -> None:
+    """A page with visible ink is still sent through the vision chain."""
+    pytest.importorskip("PIL")
+    import PIL.Image
+    import PIL.ImageDraw
+
+    ink = tmp_path / "ink.png"
+    img = PIL.Image.new("L", (200, 300), 255)
+    PIL.ImageDraw.Draw(img).rectangle([10, 10, 190, 100], fill=0)
+    img.save(ink)
+
+    fake = RunnableLambda(lambda page: f"OCR {page.index}")
+    doc = Document(
+        path=tmp_path / "doc.pdf",
+        pages=[PdfPage(index=0, width_pt=100, height_pt=200, image_path=ink)],
+    )
+    extract_document_text(doc, chain=fake, settings=_settings(), cache_dir=tmp_path / "cache")
+    assert doc.pages[0].text == "OCR 0"
+
+
+# ---------------------------------------------------------------------------
+# Local OCR fallback (precision mode) + JPEG payload compression
+# ---------------------------------------------------------------------------
+
+def test_precision_ocr_fallback_skips_vision(tmp_path: Path, monkeypatch) -> None:
+    """Readable scanned pages are transcribed by local OCR, never sent to the
+    Vision API (zero TPM spend)."""
+    vision_calls: list[int] = []
+    ocr_text = "INVOICE NR 265345 DATED 2026-02-02 supplier Phocus TOTAL 438.00 EUR"  # >=50 chars
+    monkeypatch.setattr("src.extractor._local_ocr", lambda _image_path: ocr_text)
+
+    fake = RunnableLambda(lambda page: vision_calls.append(page.index) or "VISION")
+    doc = Document(
+        path=tmp_path / "doc.pdf",
+        pages=[PdfPage(index=0, width_pt=100, height_pt=200, image_path=_png(tmp_path, "a.png"))],
+    )
+    extract_document_text(doc, chain=fake, settings=_settings(), cache_dir=tmp_path / "cache")
+    assert vision_calls == []  # OCR provided text -> vision never invoked
+    assert doc.pages[0].text == ocr_text
+
+
+def test_precision_ocr_fallback_is_cached(tmp_path: Path, monkeypatch) -> None:
+    """OCR output is persisted, so a re-run serves from cache (no re-OCR)."""
+    ocr_paths: list[Path] = []
+    ocr_text = "INVOICE NR 265345 DATED 2026-02-02 supplier Phocus TOTAL 438.00 EUR"
+    monkeypatch.setattr("src.extractor._local_ocr", lambda p: ocr_paths.append(p) or ocr_text)
+    fake = RunnableLambda(lambda page: "VISION")
+
+    doc = Document(
+        path=tmp_path / "doc.pdf",
+        pages=[PdfPage(index=0, width_pt=100, height_pt=200, image_path=_png(tmp_path, "a.png"))],
+    )
+    cache_dir = tmp_path / "cache"
+    extract_document_text(doc, chain=fake, settings=_settings(), cache_dir=cache_dir)
+    assert doc.pages[0].text == ocr_text
+    assert len(ocr_paths) == 1  # OCR ran once, result cached to disk
+
+    ocr_paths.clear()
+    extract_document_text(doc, chain=fake, settings=_settings(), cache_dir=cache_dir)
+    assert doc.pages[0].text == ocr_text
+    assert ocr_paths == []  # served from the transcription cache, no re-OCR
+
+
+def test_precision_short_ocr_is_rejected_and_vision_used(tmp_path: Path, monkeypatch) -> None:
+    """Short OCR (<50 chars) counts as "no readable text": the page is sent to
+    the Vision API, not trusted for structuring."""
+    vision_calls: list[int] = []
+    monkeypatch.setattr(
+        "src.extractor._local_ocr", lambda _image_path: "stamp only"  # 10 chars
+    )
+    fake = RunnableLambda(lambda page: vision_calls.append(page.index) or "VISION-TEXT")
+
+    doc = Document(
+        path=tmp_path / "doc.pdf",
+        pages=[PdfPage(index=0, width_pt=100, height_pt=200, image_path=_png(tmp_path, "a.png"))],
+    )
+    extract_document_text(doc, chain=fake, settings=_settings(), cache_dir=tmp_path / "cache")
+    assert vision_calls == [0]  # short OCR ignored -> vision invoked
+    assert doc.pages[0].text == "VISION-TEXT"
+
+
+def test_precision_ocr_failure_falls_through_to_vision(tmp_path: Path, monkeypatch) -> None:
+    """When local OCR yields nothing the page still goes to the vision chain."""
+    monkeypatch.setattr("src.extractor._local_ocr", lambda _image_path: None)
+    fake = RunnableLambda(lambda page: "VISION-TEXT")
+
+    doc = Document(
+        path=tmp_path / "doc.pdf",
+        pages=[PdfPage(index=0, width_pt=100, height_pt=200, image_path=_png(tmp_path, "a.png"))],
+    )
+    extract_document_text(doc, chain=fake, settings=_settings(), cache_dir=tmp_path / "cache")
+    assert doc.pages[0].text == "VISION-TEXT"
+
+
+def test_data_uri_compresses_page_to_downscaled_jpeg(tmp_path: Path) -> None:
+    """Vision payloads are downscaled to <=1000px and JPEG-compressed instead
+    of shipping full-resolution PNGs (4-5x smaller payloads)."""
+    pytest.importorskip("PIL")
+    import io
+
+    import PIL.Image
+
+    # Noise is the hardest case for PNG (it barely compresses), so any size
+    # drop proves the downscaling + JPEG path actually shrinks the payload.
+    src_png = tmp_path / "src.png"
+    PIL.Image.effect_noise((1600, 2100), 40).convert("RGB").save(src_png)
+
+    uri = _data_uri(src_png)
+    assert uri.startswith("data:image/jpeg;base64,")
+    payload = base64.b64decode(uri.split(",", 1)[1])
+    assert payload[:2] == b"\xff\xd8"  # JPEG SOI marker
+    assert len(payload) < src_png.stat().st_size  # smaller than the source PNG
+
+    img = PIL.Image.open(io.BytesIO(payload))
+    assert max(img.size) <= 1000  # longest edge capped
+
+
+def test_data_uri_falls_back_to_png_when_pillow_missing(tmp_path: Path, monkeypatch) -> None:
+    """Without Pillow, the raw PNG data-URI is produced (ever-broken pipeline)."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _block_pil(name, *args, **kwargs):
+        if name == "PIL":
+            raise ImportError("blocked for test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _block_pil)
+    png = _png(tmp_path, "raw.png")
+    uri = _data_uri(png)
+    assert uri.startswith("data:image/png;base64,")
+    assert base64.b64decode(uri.split(",", 1)[1]) == png.read_bytes()

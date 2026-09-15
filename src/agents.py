@@ -15,19 +15,21 @@ The loop is hard-capped by ``max_retries`` (configured via ``INV_MAX_RETRIES``,
 default **3**) so it terminates in finite time whatever the model does; the
 last produced autodraft (and its remaining issues) is always returned.
 
-All LLM agents target the same OpenAI-compatible provider configured in
-``.env`` (default: ``openai/gpt-oss-120b``) via :class:`src.config.Settings`.
+Hybrid provider architecture: vision transcription runs on the Hugging Face
+Serverless router (:meth:`Settings.get_vision_llm`), while all text reasoning
+here — proposer and corrector — runs on Groq (:meth:`Settings.get_text_llm`,
+``INV_TEXT_MODEL``, default ``openai/gpt-oss-120b``).
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 
 from langchain_core.messages import SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
-from langchain_openai import ChatOpenAI
 
 from src.config import Settings, get_settings
 from src.formatter import _ask, _finalize, format_autodraft, resolve_codes
@@ -96,6 +98,7 @@ class CorrectorFailure(RuntimeError):
 # Corrector chain
 # ---------------------------------------------------------------------------
 
+
 def build_corrector_chain(
     model: str | None = None,
     temperature: float | None = None,
@@ -103,8 +106,12 @@ def build_corrector_chain(
 ) -> Runnable:
     """Build the corrector runnable: (proposed, issues, text) -> :class:`Autodraft`.
 
+    The underlying LLM is created by :meth:`Settings.get_text_llm` — Groq
+    (``GROQ_API_KEY``), matching the proposer.
+
     Args:
-        model: chat model name; defaults to ``INV_STRUCTURING_MODEL``.
+        model: chat model name; defaults to ``INV_TEXT_MODEL`` (via
+            :meth:`Settings.effective_structuring_model`).
         temperature: sampling temperature; defaults to the configured value.
         settings: settings source; defaults to the process singleton.
 
@@ -113,26 +120,19 @@ def build_corrector_chain(
         and ``document_text`` keys and returning a validated :class:`Autodraft`.
 
     Raises:
-        RuntimeError: when no API key is configured.
+        RuntimeError: when no Groq API key is configured.
     """
     cfg = settings or get_settings()
-    model_name = model or cfg.structuring_model
+    model_name = model or cfg.effective_structuring_model()
     temp = cfg.structuring_temperature if temperature is None else temperature
 
     try:
-        llm = ChatOpenAI(
-            model=model_name,
-            temperature=temp,
-            base_url=cfg.provider_base_url(),
-            api_key=cfg.provider_api_key(),
-            max_tokens=cfg.effective_max_tokens(),
-            timeout=cfg.llm_timeout,
-        )
-    except Exception as exc:  # typically a missing OPENAI_API_KEY
+        llm = cfg.get_text_llm(model=model_name, temperature=temp)
+    except Exception as exc:  # pragma: no cover - credentials are checked up-front
         log.error("ChatOpenAI (corrector) construction failed: %s (%s)", type(exc).__name__, exc)
         raise RuntimeError(
-            "Cannot build the correction chain: no usable OpenAI-compatible credentials "
-            "configured (set OPENAI_API_KEY / OPENAI_BASE_URL)."
+            "Cannot build the correction chain: no usable Groq credentials "
+            "configured (set GROQ_API_KEY)."
         ) from exc
 
     prompt = ChatPromptTemplate.from_messages(
@@ -146,7 +146,7 @@ def build_corrector_chain(
             ),
         ]
     )
-    chain: Runnable = prompt | _ask(llm) | _finalize(Autodraft)
+    chain: Runnable = prompt | _ask(llm, settings=settings) | _finalize(Autodraft)
     return chain
 
 
@@ -159,6 +159,7 @@ def _corrector_for(model: str, temperature: float) -> Runnable:
 # ---------------------------------------------------------------------------
 # The loop
 # ---------------------------------------------------------------------------
+
 
 class ValidationLoop:
     """Orchestrates proposer/validator/corrector with a bounded retry count.
@@ -186,9 +187,7 @@ class ValidationLoop:
         self.master = master
         # Default retry budget honours fast mode (single-pass, 0 retries) unless
         # an explicit value is passed in; it can never exceed the hard cap.
-        self.max_retries = (
-            max_retries if max_retries is not None else cfg.effective_max_retries()
-        )
+        self.max_retries = max_retries if max_retries is not None else cfg.effective_max_retries()
         self.structuring_chain = structuring_chain
         self.corrector_chain = corrector_chain
         self.validator = MasterDataValidator(master)
@@ -214,21 +213,29 @@ class ValidationLoop:
 
         attempts = 0
         while (
-            self._has_errors(issues)
-            and attempts < self.max_retries
-            and not self._corrector_failed
+            self._has_errors(issues) and attempts < self.max_retries and not self._corrector_failed
         ):
             file_output = self._correct(file_output, issues, document_text, filename)
             issues = self.validator.validate(file_output, document_text=document_text)
             attempts += 1
-            log.info("%s: correction attempt %s/%s, %s errors remaining",
-                     filename, attempts, self.max_retries, self._error_count(issues))
+            log.info(
+                "%s: correction attempt %s/%s, %s errors remaining",
+                filename,
+                attempts,
+                self.max_retries,
+                self._error_count(issues),
+            )
 
         converged = not self._has_errors(issues)
         self.stats["corrections"] += attempts
         self.stats["converged" if converged else "not_converged"] += 1
-        log.info("%s: validation %s after %s corrections (%s issues)",
-                 filename, "CONVERGED" if converged else "NOT CONVERGED", attempts, len(issues))
+        log.info(
+            "%s: validation %s after %s corrections (%s issues)",
+            filename,
+            "CONVERGED" if converged else "NOT CONVERGED",
+            attempts,
+            len(issues),
+        )
         return ValidationResult(
             file_output=file_output,
             issues=issues,
@@ -303,8 +310,9 @@ class ValidationLoop:
         from src.validation import MasterDataValidator
 
         issue_payload = MasterDataValidator.format_issues(issues)
+        _corr_start = time.perf_counter()
         try:
-            return chain.invoke(
+            corrected = chain.invoke(
                 {
                     "proposed_json": payable.model_dump_json(),
                     "issues_json": issue_payload,
@@ -318,6 +326,12 @@ class ValidationLoop:
                 describe_error(exc),
             )
             raise CorrectorFailure(str(exc)) from exc
+        log.info(
+            "[Text Groq] Corrector pass for payable %s in %.2fs",
+            payable.invoice_number or "?",
+            time.perf_counter() - _corr_start,
+        )
+        return corrected
 
     # ------------------------------------------------------------------
     @staticmethod

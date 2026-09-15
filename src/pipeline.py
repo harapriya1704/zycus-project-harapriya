@@ -71,15 +71,21 @@ def process_document(
             min_text_chars=cfg.effective_text_layer_min_chars(),
             dpi=cfg.pdf_render_dpi,
         )
-        # Vision routing: the vision model (qwen/qwen3.8-27b) is invoked ONLY
-        # for pages rasterised as images (embedded text layer shorter than the
-        # effective ``text_layer_min_chars`` threshold ==> 0 usable chars).
+        # Vision routing: the Hugging Face vision model (zai-org/GLM-4.5V on
+        # ``router.huggingface.co``) is invoked ONLY for pages rasterised as
+        # images (embedded text layer shorter than the effective
+        # ``text_layer_min_chars`` threshold ==> 0 usable chars).
         # Text-layer pages — including every page above the fast-mode "50 char"
         # rule — are returned verbatim by ``extract_document_text`` and never
         # reach the vision API, so scanning a text-layer PDF costs zero vision
         # tokens.
         extract_document_text(document, chain=vision_chain, settings=cfg)
         document_text = document.text()
+        log.info(
+            "%s: extracted %s pages, structuring payables...",
+            pdf_path.name,
+            len(document.pages),
+        )
     except Exception as exc:  # noqa: BLE001 - degrade to argued 'declined'
         log.error("%s: extraction failed: %s", pdf_path.name, describe_error(exc))
         return _decline(exc, pdf_path.name)

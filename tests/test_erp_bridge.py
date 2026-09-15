@@ -93,8 +93,11 @@ def test_check_outputs_bridge_runs_clean(tmp_path: Path) -> None:
 
 
 def test_settings_provider_defaults() -> None:
-    """Vision targets the multimodal gateway model; structuring the text model."""
+    """Full-HF wins: vision AND text reasoning run on HF Serverless."""
     cfg = get_settings()
-    assert cfg.vision_model == "qwen/qwen3.8-27b"
-    assert cfg.structuring_model == "openai/gpt-oss-120b"
+    assert cfg.vision_model == "zai-org/GLM-4.5V"
+    assert cfg.vision_base_url == "https://router.huggingface.co/v1"
+    assert cfg.text_model == "meta-llama/Llama-3.3-70B-Instruct"
+    assert cfg.text_base_url == "https://router.huggingface.co/v1"
+    assert cfg.groq_base_url == "https://api.groq.com/openai/v1"
     assert cfg.max_retries == 3
