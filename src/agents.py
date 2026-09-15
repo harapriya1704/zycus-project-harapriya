@@ -80,7 +80,7 @@ class ValidationResult:
     file_output: FileOutput
     issues: list[ValidationIssue] = field(default_factory=list)
     attempts: int = 0  # corrections actually issued
-    converged: bool = False  # True when the final proposal is error-free
+    converged: bool = False  # True when the final proposal is error-free AND non-empty
     max_retries: int = 3
 
 
@@ -226,15 +226,16 @@ class ValidationLoop:
                 self._error_count(issues),
             )
 
-        converged = not self._has_errors(issues)
+        converged = self._converged(file_output, issues)
         self.stats["corrections"] += attempts
         self.stats["converged" if converged else "not_converged"] += 1
         log.info(
-            "%s: validation %s after %s corrections (%s issues)",
+            "%s: validation %s after %s corrections (%s issues, %s payables)",
             filename,
             "CONVERGED" if converged else "NOT CONVERGED",
             attempts,
             len(issues),
+            len(file_output.payables),
         )
         return ValidationResult(
             file_output=file_output,
@@ -337,6 +338,18 @@ class ValidationLoop:
     @staticmethod
     def _has_errors(issues: list[ValidationIssue]) -> bool:
         return any(i.severity is Severity.ERROR for i in issues)
+
+    @staticmethod
+    def _converged(file_output: FileOutput, issues: list[ValidationIssue]) -> bool:
+        """A document converges only when it has payables AND no ERROR issues.
+
+        An empty ``payables`` list is an *unvalidated failure*, not a success:
+        nothing was extracted and therefore nothing could be verified. Reporting
+        it as "converged with 0 issues" would mask an extraction failure (e.g. a
+        customs/duty invoice mis-declined without its billable charges).
+        Declined documents are likewise never "converged".
+        """
+        return bool(file_output.payables) and not ValidationLoop._has_errors(issues)
 
     @staticmethod
     def _error_count(issues: list[ValidationIssue]) -> int:

@@ -16,9 +16,9 @@ def test_precision_mode_defaults() -> None:
     assert cfg.effective_text_layer_min_chars() == cfg.text_layer_min_chars
     # No input cap in precision mode: the full page text reaches the LLM.
     assert cfg.effective_max_input_chars() == 0
-    # Text-token budget in precision mode (4096, NOT the 16K vision cap).
+    # Text-token budget in precision mode (8192, NOT the 16K vision cap).
     assert cfg.effective_max_tokens() == cfg.text_max_tokens
-    assert cfg.effective_max_tokens() == 4096
+    assert cfg.effective_max_tokens() == 8192
 
 
 def test_fast_mode_short_circuits_retries_pacing_and_vision() -> None:
@@ -33,34 +33,36 @@ def test_fast_mode_short_circuits_retries_pacing_and_vision() -> None:
     assert cfg.effective_structuring_model() == cfg.fast_structuring_model
     # The structuring prompt's input text is hard-capped at 3000 chars.
     assert cfg.effective_max_input_chars() == 3000
-    # Output tokens hard-capped at 1000 to prevent rambling.
-    assert cfg.effective_max_tokens() == 1000
+    # Output tokens stay at the precision-mode budget (8192): a smaller cap
+    # truncates long multi-line payables JSON on the gpt-oss models.
+    assert cfg.effective_max_tokens() == 8192
 
 
 def test_hybrid_provider_defaults() -> None:
-    """Vision targets HF Serverless; text reasoning targets Groq.
+    """Vision targets HF Serverless; text reasoning targets Groq's gpt-oss.
 
     Constructed with explicit values (hermetic — never coupled to the local
     ``.env``), mirroring the deployed default topology: vision on the HF
-    router, text reasoning rides Groq's OpenAI-compatible endpoint.
+    router (opt-in; easyocr is the local default), text reasoning rides
+    Groq's OpenAI-compatible endpoint serving the openai gpt-oss weights.
     """
     cfg = Settings(
         vision_model="zai-org/GLM-4.5V",
         vision_base_url="https://router.huggingface.co/v1",
-        text_model="qwen/qwen3.8-27b",
+        text_model="openai/gpt-oss-120b",
         text_base_url="https://api.groq.com/openai/v1",
         groq_base_url="https://api.groq.com/openai/v1",
-        fast_structuring_model="qwen/qwen3.8-27b",
+        fast_structuring_model="openai/gpt-oss-20b",
     )
     # Vision offloaded to the Hugging Face router.
     assert cfg.vision_model == "zai-org/GLM-4.5V"
     assert cfg.vision_base_url == "https://router.huggingface.co/v1"
     # Text reasoning follows INV_TEXT_MODEL / INV_TEXT_BASE_URL when set.
-    assert cfg.text_model == "qwen/qwen3.8-27b"
+    assert cfg.text_model == "openai/gpt-oss-120b"
     assert cfg.text_base_url == "https://api.groq.com/openai/v1"
     assert cfg.groq_base_url == "https://api.groq.com/openai/v1"
     assert cfg.structuring_model == ""  # no override -> text_model wins
-    assert cfg.fast_structuring_model == "qwen/qwen3.8-27b"
+    assert cfg.fast_structuring_model == "openai/gpt-oss-20b"
     assert cfg.effective_structuring_model() == cfg.text_model
 
 
@@ -151,7 +153,7 @@ def test_get_text_llm_targets_groq() -> None:
     assert llm.openai_api_key.get_secret_value() == "gsk-text"
     assert llm.temperature == 0.2
     # Completion cap leaves headroom for a complete payables JSON.
-    assert llm.max_tokens == 4096
+    assert llm.max_tokens == 8192
 
 
 def test_get_text_llm_override_respects_cap(monkeypatch) -> None:

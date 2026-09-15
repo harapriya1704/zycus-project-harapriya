@@ -187,10 +187,37 @@ def test_declined_documents_never_enter_corrector() -> None:
         corrector_chain=RunnableLambda(_corrector),
     )
     result = loop.run(_DOC_TEXT, "DU-01.pdf")
-    assert result.converged is True
+    assert result.converged is False  # nothing validated -> NOT converged
     assert result.file_output.payables == []
     assert len(result.file_output.declined) == 1
     assert calls == []
+    assert loop.stats["not_converged"] == 1
+    assert loop.stats["converged"] == 0
+
+
+def test_empty_payables_are_flagged_unvalidated_not_converged() -> None:
+    """A proposal with an empty payables list is an unvalidated failure.
+
+    Reporting ``converged=True`` on an empty result would mask an extraction
+    failure (e.g. a billable customs/duty invoice that was mis-declined).
+    """
+    master = MasterData.load(MASTER_DIR)
+
+    def _empty_proposer(_inputs: dict) -> FileOutput:
+        return FileOutput(file="INV-99.pdf")
+
+    loop = ValidationLoop(
+        master=master,
+        max_retries=3,
+        structuring_chain=RunnableLambda(_empty_proposer),
+    )
+    result = loop.run(_DOC_TEXT, "INV-99.pdf")
+    assert result.file_output.payables == []
+    assert result.issues == []
+    assert result.converged is False
+    assert result.attempts == 0
+    assert loop.stats["converged"] == 0
+    assert loop.stats["not_converged"] == 1
 
 
 def test_corrector_failure_keeps_proposal_and_stops_iterations() -> None:

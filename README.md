@@ -152,12 +152,19 @@ and operators — rate limits, timeouts, partial disk writes, and UI hangs inclu
    congested provider, even when quotas are exhausted.
 
 6. **Production token budgeting (text reasoning).** Text-reasoning calls
-   (`src/config.py: text_max_tokens`) request an explicit **4096-token** generation
+   (`src/config.py: text_max_tokens`) request an explicit **8192-token** generation
    window — instead of trusting a serverless endpoint's low default cap — so a complex
    multi-page invoice's full payables JSON (supplier, buyer, payment terms, line items,
-   taxes, totals) completes **without mid-payload truncation**. The structured output
+   taxes, totals) completes **without mid-payload truncation** even though Groq's
+   gpt-oss models expand every line item into its own JSON object (4k–8k output tokens
+   on long invoices). A smaller window structurally clipped the JSON and surfaced as
+   empty payables (false negative), which is why fast mode shares the same 8192 budget.
+   The structured output
    is still enforced through the Pydantic `FileOutput` schema, so a wider window never
    compromises strict schema compliance (malformed replies are rejected, not repaired).
+   Oversized transcripts are capped at `INV_MAX_STRUCTURING_CHARS` (default 12000) with
+   a **head+tail split** (`_save_truncate`) — the last pages' line items, duty/freight
+   charges and grand totals are never dropped from the LLM context.
 
 7. **Automated verification & benchmarking (`scripts/`).**
    - `scripts/check_models.py` — pre-flight health check: probes every candidate

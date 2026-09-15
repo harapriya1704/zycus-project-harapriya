@@ -101,11 +101,12 @@ class Settings(BaseSettings):
     #: Output token budget for one *text*-reasoning call (structuring + the
     #: multi-agent validation/corrector loop). Generous enough that a full
     #: payables JSON (supplier, buyer, payment_terms, line items, taxes and
-    #: totals) completes without mid-payload truncation: the Hugging Face
-    #: Serverless router otherwise stops generation at a low default limit,
-    #: clipping the JSON and surfacing as a ``JSONDecodeError``. Read from
-    #: ``INV_TEXT_MAX_TOKENS``.
-    text_max_tokens: int = Field(default=4096, ge=128, le=1_000_000)
+    #: totals) completes without mid-payload truncation: Groq's gpt-oss models
+    #: expand every line item into its own object, so a long multi-line invoice
+    #: can need 4k-8k output tokens. A cap below the real need clips the JSON
+    #: mid-payload and surfaces as a ``JSONDecodeError`` / empty payables
+    #: (false negative). Read from ``INV_TEXT_MAX_TOKENS``.
+    text_max_tokens: int = Field(default=8192, ge=128, le=1_000_000)
     #: Read timeout (seconds) for a single provider call. A hung connection
     #: becomes ``openai.APITimeoutError`` — which the retry wrapper retries —
     #: instead of freezing the process/UI forever. Kept at 45 s so a benchmark
@@ -162,6 +163,13 @@ class Settings(BaseSettings):
     #: pins a specific Groq model without editing code.
     structuring_model: str = Field(default="")
     structuring_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
+    #: Cap (chars) on the document text sent to the structuring LLM in normal
+    #: (precision) mode. ``0`` = unlimited. When a multi-page transcript
+    #: exceeds the cap it is NOT hard-cut from the front: the head (document
+    #: header / supplier / payment terms) and the tail (line items, totals and
+    #: charges on the last pages) are both preserved so later-page financial
+    #: context is never dropped (see :mod:`src.formatter._save_truncate`).
+    max_structuring_chars: int = Field(default=12000, ge=0)
 
     # ── Multi-agent validation (day 2) ───────────────────────────────────
     #: Maximum number of correction iterations in the validation loop; the
@@ -180,9 +188,9 @@ class Settings(BaseSettings):
     #: PNG, never sent to the vision model (the "> 50 chars" rule).
     fast_text_layer_min_chars: int = Field(default=50, ge=1)
     #: Lightweight structuring model for fast mode. Groq serves the OpenAI
-    #: gpt-oss weights (``openai/gpt-oss-120b``); fast mode keeps the same
-    #: well-served model but with the strict token/retry caps below.
-    fast_structuring_model: str = Field(default="openai/gpt-oss-120b")
+    #: gpt-oss weights; fast mode keeps the same quality with the lower-latency
+    #: ``openai/gpt-oss-20b`` variant and the strict token/retry caps below.
+    fast_structuring_model: str = Field(default="openai/gpt-oss-20b")
     #: Correction iterations allowed in fast mode. ``0`` = single-pass
     #: extraction: propose + validate, no LLM Corrector iterations.
     fast_max_retries: int = Field(default=0, ge=0, le=20)
@@ -190,8 +198,10 @@ class Settings(BaseSettings):
     #: mode. ``0`` disables the cap (normal precision mode passes everything).
     fast_max_input_chars: int = Field(default=3000, ge=0)
     #: Hard-cap on output tokens for structuring LLM calls in fast mode.
-    #: Prevents model rambling and keeps latency/usage minimal.
-    fast_max_tokens: int = Field(default=1000, ge=256, le=1_000_000)
+    #: Kept at the precision-mode budget: gpt-oss models expand each line item
+    #: into its own JSON object, so a small cap (the old 1000) truncated the
+    #: payload on multi-line invoices and the fast run produced empty payables.
+    fast_max_tokens: int = Field(default=8192, ge=256, le=1_000_000)
 
     # ── Logging ─────────────────────────────────────────────────────────
     log_level: str = Field(default="INFO")
@@ -263,9 +273,8 @@ class Settings(BaseSettings):
         """Output token budget for one structuring/correction LLM call.
 
         Fast mode hard-caps completion tokens to ``fast_max_tokens`` (default
-        1000) to prevent model rambling and minimise latency. Precision mode
-        uses the ``text_max_tokens`` budget (default 4096) so a full payables
-        JSON is never truncated server-side.
+        8192). Precision mode uses the ``text_max_tokens`` budget (default
+        8192) so a full payables JSON is never truncated server-side.
         """
         return self.fast_max_tokens if self.fast_mode else self.text_max_tokens
 
@@ -344,7 +353,7 @@ class Settings(BaseSettings):
             model: text-reasoning model; defaults to
                 :meth:`effective_structuring_model` (``INV_TEXT_MODEL``).
             temperature: sampling temperature; defaults to the configured value.
-            max_tokens: output cap; defaults to ``text_max_tokens`` (4096) —
+            max_tokens: output cap; defaults to ``text_max_tokens`` (8192) —
                 enough headroom for a complete payables JSON on a serverless
                 endpoint that would otherwise default to a low token limit.
 

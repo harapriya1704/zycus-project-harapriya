@@ -16,6 +16,7 @@ fields it omitted fall back to their schema defaults.
 from __future__ import annotations
 
 import json
+import re
 import time
 import typing
 from functools import lru_cache
@@ -34,13 +35,15 @@ from src.schemas import Autodraft, Declined, FileOutput
 
 log = get_logger(__name__)
 
-#: Upper bound on the document text sent to the structuring LLM (precision
-#: mode). Full-page OCR/Vision transcripts routinely exceed 20 K chars on
-#: multi-page invoices; truncating to 8000 keeps the prompt well under Groq's
-#: per-minute token budget while still covering header + line-item regions.
-#: Deterministic code resolution still sees the full text (``format_autodraft``
+#: Documented default for the precision-mode structuring input cap. Oversized
+#: multi-page transcripts are NOT hard-cut from the front (which would drop the
+#: last pages' line items and totals): :func:`_save_truncate` preserves both the
+#: head (header, supplier, payment terms) and the tail (line items, duty and
+#: charges, grand totals). Overridable via ``INV_MAX_STRUCTURING_CHARS``
+#: (:attr:`Settings.max_structuring_chars`); ``0`` disables the cap.
+#: Deterministic code resolution always sees the full text (``format_autodraft``
 #: truncates only ``text_for_llm``, never ``document_text``).
-MAX_STRUCTURING_CHARS = 8000
+MAX_STRUCTURING_CHARS = 12000
 
 #: System prompt for the structuring chain. Every rule the grader enforces is
 #: stated here; anything not on the document must stay empty.
@@ -105,9 +108,19 @@ HARD RULES:
 - NEVER fill master-data codes: supplier_id, buyer codes, payment_term_id,
   po_id, tax_type_code must all be "".
 - item_type is one of GOODS | SERVICE | FREIGHT | TAX.
+- A customs / duty / import document (often labelled "CUSTOMS_INVOICE", "DUTY
+  INVOICE", "IMPORT DECLARATION") that CARRIES billable charges IS a payable:
+  structure it. Import duty goes in excise_duties; brokerage, port/handling and
+  clearance fees are SERVICE or FREIGHT line_items (quantity x unit_price or
+  quantity "1" with unit_price = line total); freight goes in freight_charges;
+  other one-off charges in extra_charges; VAT/import taxes in taxes[] or TAX
+  lines. Decline such a document ONLY when it is a bare customs declaration
+  with NO billable amounts (duty due absent, no fees, no taxes) — a declaration
+  alone is not bookable.
 - If the document is NOT a payable (e.g. a statement, advertisement, letter,
-  duplicate, or otherwise not-bookable), return payables: [] and explain in
-  declined[] with a real doc_type and reason.
+  estimate, quotation, unpaid dunning letter, duplicate, or otherwise
+  not-bookable), return payables: [] and explain in declined[] with a real
+  doc_type and reason.
 - A single PDF may contain several payables; return one payable per bookable
   invoice. Pages that are not payables must not create payables."""
 
@@ -127,8 +140,42 @@ HARD RULES:
 - EXCLUDE category headers and subtotal/grand-total summaries from line_items (e.g. "Total New Charges", "TAXES & FEES"); keep only atomic charges.
 - item_type is GOODS|SERVICE|FREIGHT|TAX. A TAX line carries total/tax_amount with empty quantity and unit_price.
 - NEVER fill master-data codes: supplier_id, buyer codes, payment_term_id, po_id, tax_type_code stay "".
-- Not a payable (statement, duplicate, advert, letter) -> payables:[] and a declined[] entry with real doc_type/reason.
+- A CUSTOMS / DUTY / IMPORT document that bills charges (import duty, brokerage, port/handling fees, freight, taxes) IS a payable: structure it. Put duty in excise_duties; brokerage/port/handling/clearance as SERVICE or FREIGHT line_items; freight in freight_charges; other one-off charges in extra_charges. Decline such a document ONLY when it carries no billable amounts (a bare customs declaration with no charges is not bookable).
+- Not a payable (statement, duplicate, advert, estimate, quotation, letter, unpaid dunning letter) -> payables:[] and a declined[] entry with real doc_type/reason.
 - A PDF may hold several payables. Return ONLY the JSON, no preamble."""
+
+
+def _save_truncate(text: str, limit: int) -> str:
+    """Truncate *text* to at most *limit* chars, preserving head AND tail.
+
+    Multi-page invoices put the header, supplier and payment terms on page one
+    and the line items, duty/freight charges and the grand total on the last
+    pages. A naive ``text[:limit]`` drops that later financial context entirely
+    — the exact failure that produced mis-classified declines. This keeps the
+    first part of the transcript and the last part, joining them with an
+    explicit marker so it is obvious the LLM does not see the full document.
+
+    Args:
+        text: the full document transcript.
+        limit: maximum character budget for the window.
+
+    Returns:
+        ``text`` unchanged when it fits; otherwise a head+tail window of at
+        most ``limit`` characters.
+    """
+    if len(text) <= limit:
+        return text
+    marker = f"\n... [MIDDLE OMITTED: {len(text) - limit} chars of this transcript are not shown] ...\n"
+    tail_budget = min(len(text), limit // 2)
+    head_budget = limit - len(marker) - tail_budget
+    if head_budget <= 0:
+        # Tiny limit: shrink the marker (and tail) rather than dropping the tail.
+        marker = "\n... [MIDDLE OMITTED] ...\n"
+        tail_budget = max(0, min(len(text), limit - len(marker) - 1))
+        head_budget = max(0, limit - len(marker) - tail_budget)
+    head = text[:head_budget]
+    tail = text[len(text) - tail_budget :]
+    return head + marker + tail
 
 
 def build_autodraft_chain(
@@ -136,6 +183,7 @@ def build_autodraft_chain(
     temperature: float | None = None,
     settings: Settings | None = None,
     fast_mode: bool = False,
+    system_prompt: str | None = None,
 ) -> Runnable:
     """Build the LangChain runnable: document text -> :class:`FileOutput`.
 
@@ -154,6 +202,9 @@ def build_autodraft_chain(
         settings: settings source; defaults to the process singleton.
         fast_mode: use the streamlined fast-mode system prompt (half the
             input tokens, same hard rules).
+        system_prompt: override the system prompt entirely (used by the
+            customs/duty re-structure fallback, which appends a corrective
+            instruction to the stock prompt).
 
     Returns:
         A ``Runnable`` accepting ``{"document_text": str}`` and returning a
@@ -178,17 +229,94 @@ def build_autodraft_chain(
     # The system prompt is passed as a *fixed* SystemMessage (not a template):
     # it contains literal ``{``/``}`` for the JSON examples, which must not be
     # treated as f-string replacement fields. Fast mode swaps in the compact
-    # variant (identical rules, far fewer input tokens).
-    system_prompt = _STRUCTURING_SYSTEM_PROMPT_FAST if fast_mode else _STRUCTURING_SYSTEM_PROMPT
+    # variant (identical rules, far fewer input tokens); an explicit override
+    # always wins over either stock prompt.
+    if system_prompt is not None:
+        base_prompt = system_prompt
+    else:
+        base_prompt = _STRUCTURING_SYSTEM_PROMPT_FAST if fast_mode else _STRUCTURING_SYSTEM_PROMPT
     prompt = ChatPromptTemplate.from_messages(
         [
-            SystemMessage(content=system_prompt),
+            SystemMessage(content=base_prompt),
             ("human", "Document text:\n\n{document_text}"),
         ]
     )
 
     chain: Runnable = prompt | _ask(llm, settings=settings) | _finalize(FileOutput)
     return chain
+
+
+#: ``doc_type`` values that mean "customs / duty / import document". These ARE
+#: bookable when they carry duty/brokerage/port/freight/tax amounts — see
+#: :func:`_looks_like_billable_customs` and the re-structure fallback in
+#: :func:`format_autodraft`.
+_CUSTOMS_DECLINE_TYPES: frozenset[str] = frozenset(
+    {
+        "CUSTOMS_INVOICE",
+        "CUSTOMS",
+        "CUSTOMS_DECLARATION",
+        "CUSTOMS_DUTY_INVOICE",
+        "DUTY_INVOICE",
+        "DUTY",
+        "IMPORT_INVOICE",
+        "IMPORT",
+        "IMPORT_DECLARATION",
+        "HARMONIZED",
+    }
+)
+
+#: Keywords that mark a customs/duty/import context.
+_CUSTOMS_KEYWORDS: tuple[str, ...] = (
+    "customs",
+    "custom",
+    "duty",
+    "duties",
+    "import",
+    "brokerage",
+    "broker",
+    "declaration",
+    "harmonized",
+    "harmonised",
+    "hs code",
+    "clearance",
+)
+
+#: Currency/code-prefixed or dot/comma-decimal money markers. Used to decide
+#: whether a customs-looking decline actually carried billable amounts.
+_AMOUNT_PATTERN = re.compile(
+    r"(?:\u20ac|USD\s*\$?|EUR|GBP|INR|\$\s*)?(?<![A-Za-z])\d[\d.,]{1,}\.\d{2}(?![A-Za-z])"
+    r"|(?:\u20ac|\$|UK\u00a3|UK ?\u00a3|\u00a3|\bEUR\b|\bUSD\b|\bGBP\b)\s?\d[\d.,]{0,}",
+    re.IGNORECASE,
+)
+
+#: Instruction appended to the stock system prompt when a customs/duty decline
+#: is detected on a document that visibly carries billable amounts. One bounded
+#: re-structure restores the payable instead of silently dropping it.
+_CUSTOMS_RESTRUCTURE_NOTE = """
+
+IMPORTANT CORRECTION:
+The previous pass classified this document as a customs/duty/import document
+and declined it, but the document text carries BILLABLE amounts (import duty,
+brokerage, port/handling/clearance fees, freight and/or taxes). Re-classify it
+as a PAYABLE and structure it: put import duty in "excise_duties";
+brokerage/port/handling/clearance charges as SERVICE or FREIGHT line_items
+(with explicit quantity and unit_price; a flat fee uses quantity "1" and
+unit_price equal to the line total); freight in "freight_charges"; other
+one-off charges in "extra_charges"; VAT/import taxes in "taxes". Do NOT decline
+the document again unless it genuinely shows no billable amounts."""
+
+
+def _looks_like_billable_customs(text: str) -> bool:
+    """True when *text* mentions customs/duty/import AND carries money amounts.
+
+    A bare customs declaration (no duty, fees or taxes) is legitimately not
+    bookable; a customs/duty invoice that prints duties, brokerage or freight is
+    billable and must be structured, not declined.
+    """
+    lowered = text.lower()
+    if not any(keyword in lowered for keyword in _CUSTOMS_KEYWORDS):
+        return False
+    return bool(_AMOUNT_PATTERN.search(text))
 
 
 def _ask(llm: ChatOpenAI, settings: Settings | None = None) -> Runnable:
@@ -444,24 +572,26 @@ def format_autodraft(
     struct_model = cfg.effective_structuring_model() if chain is None else "override-chain"
 
     # Token budget: fast mode caps the input at ``fast_max_input_chars``
-    # (default 3000); precision mode truncates oversized multi-page transcripts
-    # to ``MAX_STRUCTURING_CHARS`` (8000). Deterministic code resolution still
-    # sees the full text, so master matching is unaffected.
+    # (default 3000). Precision mode applies ``max_structuring_chars`` (default
+    # 12000; 0 = unlimited) with a head+tail split so the last pages' line
+    # items, charges and totals are never dropped. Deterministic code
+    # resolution still sees the full text, so master matching is unaffected.
     cap = cfg.effective_max_input_chars()
     text_for_llm = document_text if cap <= 0 else document_text[:cap]
-    if len(text_for_llm) > MAX_STRUCTURING_CHARS:
-        text_for_llm = text_for_llm[:MAX_STRUCTURING_CHARS]
+    limit = cfg.max_structuring_chars
+    if limit > 0 and len(text_for_llm) > limit:
+        text_for_llm = _save_truncate(text_for_llm, limit)
         log.info(
-            "%s: truncated structuring input to %s chars (was %s)",
+            "%s: truncated structuring input to %s chars (was %s, head+tail kept)",
             filename,
-            MAX_STRUCTURING_CHARS,
+            limit,
             len(document_text),
         )
     log.info(
         "%s: structuring %s chars of text (budget %s)",
         filename,
         len(text_for_llm),
-        cap or "unlimited",
+        cap or limit or "unlimited",
     )
     _struct_start = time.perf_counter()
     result: FileOutput = effective_chain.invoke({"document_text": text_for_llm})
@@ -470,6 +600,44 @@ def format_autodraft(
         time.perf_counter() - _struct_start,
         struct_model,
     )
+
+    # Customs/duty mis-classification backstop: a billable customs/duty invoice
+    # (duty, brokerage, freight, taxes present) must never be silently declined.
+    # If the first pass declined it and the document visibly carries amounts,
+    # re-structure once with an explicit corrective instruction. Bounded to one
+    # extra call; a retry failure falls back to the original decline.
+    if not result.payables and _looks_like_billable_customs(document_text):
+        declined_types = {str(d.doc_type).strip().upper() for d in result.declined if d.doc_type}
+        if declined_types & _CUSTOMS_DECLINE_TYPES:
+            base_prompt = (
+                _STRUCTURING_SYSTEM_PROMPT_FAST
+                if cfg.fast_mode
+                else _STRUCTURING_SYSTEM_PROMPT
+            )
+            retry_chain = build_autodraft_chain(
+                temperature=cfg.structuring_temperature,
+                settings=cfg,
+                fast_mode=cfg.fast_mode,
+                system_prompt=base_prompt + _CUSTOMS_RESTRUCTURE_NOTE,
+            )
+            try:
+                retried = retry_chain.invoke({"document_text": text_for_llm})
+            except Exception as exc:  # noqa: BLE001 - keep the original decline on failure
+                log.warning(
+                    "%s: customs/duty re-structure failed (%s); keeping the first decline",
+                    filename,
+                    type(exc).__name__,
+                )
+                retried = None
+            if retried is not None and retried.payables:
+                log.info(
+                    "%s: declined as customs/duty but billable amounts found; "
+                    "re-structured -> %s payable(s)",
+                    filename,
+                    len(retried.payables),
+                )
+                result = retried
+
     result.file = filename
 
     effective_master = master if master is not None else MasterData.load_default(settings=cfg)

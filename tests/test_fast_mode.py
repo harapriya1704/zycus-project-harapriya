@@ -166,9 +166,10 @@ def test_format_autodraft_precision_passes_full_text() -> None:
         settings=cfg,
     )
     assert seen["text"] == "short text"
-    # ...but oversized multi-page transcripts are capped at MAX_STRUCTURING_CHARS
-    # so prompt tokens stay under the provider's per-minute budget.
-    long_text = "x" * 9000
+    # ...while oversized multi-page transcripts stay capped at
+    # MAX_STRUCTURING_CHARS (head+tail kept) so prompt tokens stay under the
+    # provider's per-minute budget without dropping later-page totals.
+    long_text = "x" * (MAX_STRUCTURING_CHARS + 1000)
     format_autodraft(
         document_text=long_text,
         filename="F.pdf",
@@ -176,7 +177,9 @@ def test_format_autodraft_precision_passes_full_text() -> None:
         master=MasterData(),
         settings=cfg,
     )
-    assert len(seen["text"]) == MAX_STRUCTURING_CHARS
+    assert len(seen["text"]) <= MAX_STRUCTURING_CHARS
+    assert seen["text"].startswith("x")
+    assert seen["text"].endswith("x")
 
 
 # ---------------------------------------------------------------------------
