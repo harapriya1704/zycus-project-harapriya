@@ -301,6 +301,12 @@ Layout:
 If a matching `output/<file>.json` already exists it is loaded for auditing
 without re-running the pipeline; clicking **Run Pipeline** regenerates it.
 
+
+
+**Demo Link** - https://github.com/user-attachments/assets/cd48e1ac-2ffc-454e-af82-b8881984c749
+
+
+
 ## Repository layout
 
 | Path | Purpose |
