@@ -5,6 +5,9 @@ __pycache__/
 .venv/
 venv/
 
+# Pytest
+.pytest_cache/
+
 # Env & secrets
 .env
 .env.*
@@ -12,8 +15,10 @@ venv/
 
 # Project artifacts
 output/
+output-test/
 logs/
 .cache/
+.benchmark/
 
 # Tooling
 .DS_Store

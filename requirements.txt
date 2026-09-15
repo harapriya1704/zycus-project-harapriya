@@ -11,6 +11,13 @@ pydantic-settings>=2.3.0
 pymupdf>=1.24.0
 pypdf>=5.0.0
 
+# ── Local OCR (default extraction path) ─────────────────────────────
+# easyocr provides CPU-based OCR for scanned pages so a default run (no
+# --use-llm) never needs the Vision LLM. torch is pulled in transitively.
+easyocr>=1.7.1
+numpy>=1.24.0
+Pillow>=10.0.0
+
 # ── Runtime / env ─────────────────────────────────────────────────
 python-dotenv>=1.0.0
 tiktoken>=0.7.0
@@ -19,6 +26,9 @@ requests>=2.31.0
 # ── API surface (later phases) ────────────────────────────────────
 fastapi>=0.111.0
 uvicorn>=0.30.0
+
+# ── Streamlit dashboard ───────────────────────────────────────────
+streamlit>=1.50.0
 
 # ── Testing / dev ─────────────────────────────────────────────────
 pytest>=8.0.0

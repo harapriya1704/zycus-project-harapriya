@@ -1,0 +1,248 @@
+"""Tests for the multi-agent validation loop (:mod:`src.agents`).
+
+The loop is exercised with fake proposer/corrector runnables so no API key is
+needed — the point is the *orchestration*: propose -> validate -> correct with
+a hard ``max_retries`` cap.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from langchain_core.runnables import RunnableLambda
+from src.agents import ValidationLoop
+from src.master_data import MasterData
+from src.schemas import Autodraft, FileOutput
+
+MASTER_DIR = Path(__file__).resolve().parent.parent / "master_data"
+
+_DOC_TEXT = "Invoice 265345, Phocus Direct Communication GmbH, DE209177122, gross 438.00 EUR"
+
+
+def _clean_autodraft() -> Autodraft:
+    return Autodraft(
+        invoice_number="265345",
+        currency="EUR",
+        gross_total="292.00",
+        supplier={"name": "Phocus Direct Communication GmbH", "supplier_id": "2845695"},
+        line_items=[
+            {
+                "description": "Projektmanagement",
+                "item_type": "SERVICE",
+                "quantity": "4",
+                "unit_price": "73.00",
+                "total": "292.00",
+            }
+        ],
+    )
+
+
+def _sample_chain() -> RunnableLambda:
+    return RunnableLambda(lambda inputs: FileOutput(file="INV-99.pdf", payables=[_clean_autodraft()]))
+
+
+def test_loop_converges_first_pass_no_corrections() -> None:
+    master = MasterData.load(MASTER_DIR)
+    loop = ValidationLoop(master=master, max_retries=3, structuring_chain=_sample_chain())
+    result = loop.run(_DOC_TEXT, "INV-99.pdf")
+    assert result.converged is True
+    assert result.attempts == 0
+    assert len(result.file_output.payables) == 1
+    assert result.file_output.payables[0].supplier.supplier_id == "2845695"
+
+
+def test_loop_bounded_corrections_persist_issues() -> None:
+    master = MasterData.load(MASTER_DIR)
+
+    def _bad_proposer(_inputs: dict) -> FileOutput:
+        return FileOutput(
+            file="INV-99.pdf",
+            payables=[Autodraft(invoice_number="1", currency="EUR", gross_total="999.00",
+                                buyer={"company_code": "ZZZ", "business_unit_code": "", "location_code": ""})],
+        )
+
+    def _never_fixes(_inputs: dict) -> Autodraft:
+        # Returns the same broken payable regardless of the issues it saw.
+        return Autodraft(invoice_number="1", currency="EUR", gross_total="999.00")
+
+    loop = ValidationLoop(
+        master=master,
+        max_retries=3,
+        structuring_chain=RunnableLambda(_bad_proposer),
+        corrector_chain=RunnableLambda(_never_fixes),
+    )
+    result = loop.run(_DOC_TEXT, "INV-99.pdf")
+    assert result.attempts == 3  # hard cap, no infinite generation
+    assert result.converged is False
+    assert loop.stats["corrections"] == 3
+    assert loop.stats["not_converged"] == 1
+
+
+def test_loop_converges_after_correction() -> None:
+    master = MasterData.load(MASTER_DIR)
+
+    def _bad_proposer(_inputs: dict) -> FileOutput:
+        return FileOutput(
+            file="INV-99.pdf",
+            payables=[Autodraft(invoice_number="1", currency="EUR", gross_total="999.00")],
+        )
+
+    def _fixes(_inputs: dict) -> Autodraft:
+        return _clean_autodraft()
+
+    loop = ValidationLoop(
+        master=master,
+        max_retries=3,
+        structuring_chain=RunnableLambda(_bad_proposer),
+        corrector_chain=RunnableLambda(_fixes),
+    )
+    result = loop.run(_DOC_TEXT, "INV-99.pdf")
+    assert result.attempts == 1
+    assert result.converged is True
+    assert result.file_output.payables[0].supplier.supplier_id == "2845695"
+
+
+def test_max_retries_cap_respected_with_zero_retries() -> None:
+    master = MasterData.load(MASTER_DIR)
+
+    def _bad_proposer(_inputs: dict) -> FileOutput:
+        return FileOutput(file="INV-99.pdf",
+                          payables=[Autodraft(invoice_number="1", currency="EUR", gross_total="999.00")])
+
+    def _never_fixes(_inputs: dict) -> Autodraft:
+        return Autodraft(invoice_number="1", currency="EUR", gross_total="999.00")
+
+    loop = ValidationLoop(
+        master=master,
+        max_retries=1,
+        structuring_chain=RunnableLambda(_bad_proposer),
+        corrector_chain=RunnableLambda(_never_fixes),
+    )
+    result = loop.run(_DOC_TEXT, "INV-99.pdf")
+    assert result.attempts in (0, 1)
+    assert result.attempts <= 1
+
+
+def test_zero_retries_is_single_pass_no_corrector() -> None:
+    """Fast mode caps retries at 0: propose + validate only, no Corrector calls."""
+    master = MasterData.load(MASTER_DIR)
+    corrector_calls: list[dict] = []
+
+    def _bad_proposer(_inputs: dict) -> FileOutput:
+        return FileOutput(file="INV-99.pdf",
+                          payables=[Autodraft(invoice_number="1", currency="EUR", gross_total="999.00")])
+
+    def _corrector(inputs: dict) -> Autodraft:
+        corrector_calls.append(inputs)
+        return _clean_autodraft()
+
+    loop = ValidationLoop(
+        master=master,
+        max_retries=0,
+        structuring_chain=RunnableLambda(_bad_proposer),
+        corrector_chain=RunnableLambda(_corrector),
+    )
+    result = loop.run(_DOC_TEXT, "INV-99.pdf")
+    # Errors remain (nothing corrected), but zero LLM correction inferences ran.
+    assert result.attempts == 0
+    assert corrector_calls == []
+    assert result.converged is False
+    assert loop.stats["corrections"] == 0
+
+
+def test_loop_default_retries_honor_fast_mode_settings() -> None:
+    """A ValidationLoop built from fast-mode settings defaults to 0 retries."""
+    from src.config import Settings
+
+    master = MasterData.load(MASTER_DIR)
+    loop = ValidationLoop(
+        master=master,
+        settings=Settings(fast_mode=True),
+        structuring_chain=RunnableLambda(lambda _i: FileOutput(file="X.pdf")),
+    )
+    assert loop.max_retries == 0
+
+
+def test_declined_documents_never_enter_corrector() -> None:
+    """A declined (no payable) document must produce no correction calls."""
+    master = MasterData.load(MASTER_DIR)
+    calls: list[dict] = []
+
+    def _declining_proposer(_inputs: dict) -> FileOutput:
+        from src.schemas import Declined
+
+        return FileOutput(
+            file="DU-01.pdf",
+            declined=[Declined(doc_type="STATEMENT", reason="Not a payable.")],
+        )
+
+    def _corrector(inputs: dict):
+        calls.append(inputs)
+        return _clean_autodraft()
+
+    loop = ValidationLoop(
+        master=master,
+        max_retries=3,
+        structuring_chain=RunnableLambda(_declining_proposer),
+        corrector_chain=RunnableLambda(_corrector),
+    )
+    result = loop.run(_DOC_TEXT, "DU-01.pdf")
+    assert result.converged is False  # nothing validated -> NOT converged
+    assert result.file_output.payables == []
+    assert len(result.file_output.declined) == 1
+    assert calls == []
+    assert loop.stats["not_converged"] == 1
+    assert loop.stats["converged"] == 0
+
+
+def test_empty_payables_are_flagged_unvalidated_not_converged() -> None:
+    """A proposal with an empty payables list is an unvalidated failure.
+
+    Reporting ``converged=True`` on an empty result would mask an extraction
+    failure (e.g. a billable customs/duty invoice that was mis-declined).
+    """
+    master = MasterData.load(MASTER_DIR)
+
+    def _empty_proposer(_inputs: dict) -> FileOutput:
+        return FileOutput(file="INV-99.pdf")
+
+    loop = ValidationLoop(
+        master=master,
+        max_retries=3,
+        structuring_chain=RunnableLambda(_empty_proposer),
+    )
+    result = loop.run(_DOC_TEXT, "INV-99.pdf")
+    assert result.file_output.payables == []
+    assert result.issues == []
+    assert result.converged is False
+    assert result.attempts == 0
+    assert loop.stats["converged"] == 0
+    assert loop.stats["not_converged"] == 1
+
+
+def test_corrector_failure_keeps_proposal_and_stops_iterations() -> None:
+    """A corrector that throws must not lose the document nor burn retries."""
+    master = MasterData.load(MASTER_DIR)
+
+    def _bad_proposer(_inputs: dict) -> FileOutput:
+        return FileOutput(
+            file="INV-99.pdf",
+            payables=[Autodraft(invoice_number="1", currency="EUR", gross_total="999.00")],
+        )
+
+    def _exploding_corrector(_inputs: dict) -> Autodraft:
+        raise RuntimeError("provider 500 after every retry")
+
+    loop = ValidationLoop(
+        master=master,
+        max_retries=3,
+        structuring_chain=RunnableLambda(_bad_proposer),
+        corrector_chain=RunnableLambda(_exploding_corrector),
+    )
+    result = loop.run(_DOC_TEXT, "INV-99.pdf")
+    # The proposal is kept (document is not lost), and only ONE correction
+    # attempt is made — the loop sees the broken corrector and stops.
+    assert result.file_output.payables[0].gross_total == "999.00"
+    assert result.attempts == 1
+    assert result.converged is False
+    assert loop.stats["corrections"] == 1

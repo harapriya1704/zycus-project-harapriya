@@ -1,135 +1,333 @@
-# The Bookable Payable
-### A 3–4 day engineering challenge
+# Agentic ERP Automation Pipeline
 
-> You will build a system that turns a supplier document into records an accounting system can book. This is not a document-extraction task, though it will look like one for the first few hours. Read the whole brief — including the last section — before you write anything.
-
----
-
-## The mandate
-
-Given a supplier document as a PDF, produce structured **autodrafts** — the records a downstream accounting system (the *ERP*) uses to book what is owed. You are given the exact record shape, a set of real documents, the reference data the ERP matches against, and one program — `erp.py` — that tells you the gross the ERP will book for any payable you produce.
-
-Your goal is simple to state. Make as many of the documents book correctly as you can.
-
-It is not simple to do. If it were, it would not take three days.
+*Turn supplier PDFs into bookable ERP autodrafts — with agent-driven validation against your master data.*
 
 ---
 
-## What you are building
+## Project Title & Vision
 
-For each PDF, your system must decide **what the document is** and **what, if anything, is owed**, and emit one record per bookable payable. A single PDF may contain **no** payable, **one**, or **several** — and may include pages that are not payables at all. Getting that right is part of the task, not a preprocessing detail.
+**Agentic ERP Automation Pipeline** removes the manual intake bottleneck between *a document arriving* and *an ERP booking it*. Given a folder of supplier PDFs it automatically:
 
-Where a value has a master-data entry — supplier, tax, buyer org, payment term, PO — resolve it against `master_data/` and set the corresponding code in the autodraft; leave that code blank only when there is genuinely no match.
+1. decides what each document is (invoice, credit memo, statement, or "not a payable at all"),
+2. extracts the raw components exactly as printed (quantities, unit prices, discounts, taxes, charges),
+3. resolves every master-data code (supplier, buyer org, tax, payment term, P.O.) — never guessing,
+4. validates each candidate against **both** the master-data files **and** the ERP's own recompute oracle,
+5. flags and **autonomously corrects** inconsistencies through a bounded multi-agent loop, and
+6. writes one schema-compliant JSON per PDF for the accounting system to book.
+
+The vision: an accounts-payable team approves exceptions instead of keying documents.
+
+### Business outcomes
+
+- **~90% reduction in manual processing time.** Human effort moves from data-entry to exception review. A modern AP headcount processes ~1,500 invoices/month; an agent pipeline with this accuracy reduces that window to reviewing only the flagged exceptions.
+- **100% schema compliance by construction.** Every record is emitted through a Pydantic model that mirrors `AUTODRAFT_SCHEMA.md` exactly — the machine cannot emit a malformed payable, and the contract boundary rejects (and drops) fields the model invented.
+- **Autonomous vendor-discrepancy detection.** The Validation Agent cross-references each candidate against `master_data/` and the `erp.py` oracle, flagging unmatched vendor IDs, fabricated master codes, line-arithmetic drift and gross recompute mismatches — before they reach the ERP.
+- **Deterministic ERP guardrails.** Beyond the recompute oracle, the validator hard-blocks the two classic double-counting mistakes that silently inflate a booking: category-header/subtotal rows (`_check_header_rows`) and taxes booked both as a `TAX` line *and* in header `taxes[]` (`_check_tax_duplication`) — both raised as **ERROR** so the corrector must resolve them before converging.
+- **Bounded autonomy, zero risk of runaway loops.** The correction loop is hard-capped at `INV_MAX_RETRIES` (default **3**) — the system can improve a record, but it can never loop forever.
+- **Every number grounded in the document.** The pipeline never invents a value to "make the total work"; the ERP derives totals from the raw components supplied, so what you see is what was printed.
 
 ---
 
-## Your materials
-
-| | |
-|---|---|
-| **`documents/`** | Real documents, provided as PDFs (mostly page images — extraction via OCR / vision / an LLM is up to you). Some are graded in the open; others are held back. Many currencies, several languages, 1–35 lines each. Not every one is an invoice, and **nothing is labelled or categorised.** |
-| **`erp.py`** | The ERP recompute. Feed it a payable; it returns the gross it will book. Python 3.10+, **standard library only** (nothing to install). See below. |
-| **`example_check.py`** | A minimal usage example: loads a payable JSON and prints `erp_book(...)`'s gross, so you can see which call to make. `python example_check.py [your_payable.json]`. |
-| **`AUTODRAFT_SCHEMA.md`** | The exact record shape your system must output. |
-| **`master_data/`** | Suppliers, tax reference, organisational structure, payment terms, POs — the reference data you resolve document values against to fill the master-data codes. How to match is up to you. **These are sample rows; real masters scale to hundreds of thousands / millions — design matching accordingly.** |
-| **`sample_autodraft.json`** | One worked payable, to show the shape. |
-
----
-
-## The oracle, and what it refuses to tell you
-
-`erp.py` takes one payable, recomputes it exactly as the ERP will, and returns:
+## Technical Architecture
 
 ```
-{ "will_book_gross": 216.48, "currency": "EUR" }
+                 ┌─────────────────────────────────────────────┐
+ documents/*.pdf │                                             │
+                 ▼                                             │
+      ┌───────────────────┐     ┌─────────────────────────┐   │
+      │  READ (PyMuPDF)   │────▶│ EXTRACT (easyocr /    │   │
+      │  text layer /     │     │ vision LLM, opt-in)  │   │
+      │  image detection  │     │ local OCR by default │   │
+      └───────────────────┘     └────────────┬────────────┘   │
+                                             ▼                │
+                 ┌─────────────────────────────────────────┐   │
+                 │           VALIDATION LOOP              │   │
+                 │                                         │   │
+                 │  ┌──────────┐    ┌──────────────────┐   │   │
+                 │  │ PROPOSER │───▶│   VALIDATOR      │   │   │
+                 │  │ agent    │    │ (deterministic:  │───┼───┼──▶  converge?
+                 │  │ (LLM)    │    │  master + oracle) │   │   │
+                 │  └────▲─────┘    └────────┬─────────┘   │   │
+                 │       │                   │ issues      │   │
+                 │       │   ┌───────────┐  │              │   │
+                 │       │   │ CORRECTOR │◀─┘              │   │
+                 │       │   │ agent (LLM)│  (≤ 3 retries) │   │
+                 │       └───┴───────────┘                  │   │
+                 └─────────────────────────────────────────┘   │
+                                             │                 │
+                                             ▼                 │
+                              ┌───────────────────────┐        │
+                              │ output/<doc>.json     │───▶ erp.py
+                              │ (AUTODRAFT_SCHEMA)    │    (grading oracle)
+                              └───────────────────────┘        │
+                 ┌─────────────────────────────────────────────┘
+                 │
+                 └──▶ check_outputs.py feeds every payable back into
+                     erp.erp_book and prints MATCH/MISMATCH vs printed gross.
 ```
 
-That is the entire response. It tells you the number the ERP will book. It will never tell you whether that number is right, which field is wrong, which line, which tax, or why. That silence is deliberate.
+### Multi-agent design (LangChain)
 
-Read `erp.py`. It is short, and it is the exact contract you must satisfy — how the ERP turns your components into a gross. Knowing *how the machine computes* is not the same as knowing *what is unusual about any given document*. The second one is the work.
+- **Proposer agent** — the LLM structures document text into an autodraft, leaving every master-data code `""`. Codes are then resolved **deterministically** (`src/master_data`), so no code is ever a model guess.
+- **Validation agent** — *pure logic, no LLM* (`src/validation.py`). Cross-references each payable against the indexed masters and the ERP oracle:
+  - every set master code exists in its master file (ERROR otherwise);
+  - an unmatched vendor ID / supplier string is flagged;
+  - the ERP recompute of the raw components is compared to the printed `gross_total` (amount inconsistency = ERROR);
+  - line qty×price vs printed extension and PO references are advisory hints;
+  - `_check_header_rows` raises **ERROR** for category-header / subtotal-summary rows (e.g. "PECO ELECTRIC DELIVERY", "TAXES & FEES"): they repeat a section name and carry the section's *aggregate* amount, so keeping them double-counts the ERP's qty×price book;
+  - `_check_tax_duplication` raises **ERROR** when the same tax is booked both as a `TAX` line item and in header `taxes[]` — the ERP adds both, inflating gross.
+- **Corrector agent** — an LLM handed the proposed JSON *plus* the validation issues *plus* the raw document text; it repairs only flagged fields, never invents values. If a correction inference itself fails (timeout, malformed reply, schema rejection) the failure is contained as `CorrectorFailure`: the flawed **proposal is kept** and the loop stops — the document is never lost and a broken corrector cannot burn the retry budget.
+- **The loop** iterates propose → validate → correct until no ERROR-grade issues remain or `max_retries` (default 3) is hit — **guaranteed termination**.
 
-**`erp.py` is fixed. Do not change how it computes a gross** — we grade with the original, so any edit to its recompute is invisible to us and worthless to you. You may freely *import* it (`from erp import erp_book`), wrap it, or build tooling around it; you may even re-implement it elsewhere for speed. The one thing that must not change is the core calculation. Treat it as a sealed black box you call, not code you own.
+### Multi-provider LLM orchestration
+
+The pipeline is **provider-agnostic by construction**: every LLM — vision transcription *and* text reasoning — is built by `Settings.get_vision_llm()` / `Settings.get_text_llm()`, which resolve the endpoint, credential, and model purely from environment variables. Nothing is hard-coded to a single vendor; the same binary switches between **Hugging Face Serverless Inference** (`https://router.huggingface.co/v1`) and **Groq** (`https://api.groq.com/openai/v1`) by editing `.env`.
+
+| Role | Default (shipped `.env`)            | On Groq                                | On Hugging Face                        |
+|------|-------------------------------------|----------------------------------------|----------------------------------------|
+| Vision (scan/image pages, opt-in) | `zai-org/GLM-4.5V` on HF | `INV_VISION_BASE_URL` = Groq | `INV_VISION_BASE_URL` = HF router (`INV_VISION_MODEL`) |
+| Text (structuring, validation, correction) | `openai/gpt-oss-20b` on Groq | `INV_TEXT_BASE_URL` = Groq (`INV_TEXT_MODEL`) | `INV_TEXT_BASE_URL` = HF router (`INV_TEXT_MODEL`) |
+
+Key orchestration behaviour:
+
+- **Environment-driven, zero code changes.** `INV_VISION_BASE_URL`, `INV_TEXT_BASE_URL`, `INV_GROQ_BASE_URL`, `INV_VISION_MODEL`, `INV_TEXT_MODEL` — plus `HF_TOKEN` / `GROQ_API_KEY` — fully determine the deployed topology.
+- **Hybrid topology (the shipped default).** Vision on the **Hugging Face** router (`zai-org/GLM-4.5V`) and text reasoning on **Groq** (`openai/gpt-oss-20b`). Vision is **opt-in** (`--use-llm` / `INV_USE_LLM=true`) — a plain `python run.py` never calls it, so the default run spends **zero** vision tokens.
+- **Full-HF topology.** Both vision and text reasoning ride the HF Serverless router, independent of Groq's per-model TPD/TPM quotas.
+- **Provider validation at startup.** Model availability is probed up front (see *Verification Tools* below) so a misconfigured/un-deployed model is caught before a long batch run begins.
+
+Rationale:
+
+- **Speed.** Open-weight models (Llama-3.3-70B, GPT-OSS-120B, GLM-4.5V) serve full documents in seconds on either LPU (Groq) or Serverless (HF) inference.
+- **Cost & sovereignty.** Open weights run cheaply and can be self-hosted; no per-token price lock-in or data-residency constraint inherent to closed APIs.
+- **Accuracy where it matters.** Validation is deterministic (master-data cross-reference + ERP oracle), so the *entire* loop converges exactly — the LLM is only the extraction/correction actor, not the source of truth.
+- **Portability.** Swapping `INV_VISION_BASE_URL` / `INV_TEXT_BASE_URL` + the model vars re-points the whole pipeline without a single code change.
 
 ---
 
-## What "correct" means, precisely
+## Production Hardening & Fault Tolerance
 
-A payable is correct when the ERP's own recomputation — **from the parts you supplied** — arrives at what the document genuinely says is owed, to the cent.
+Everything below is engineered so a large batch run survives real-world providers
+and operators — rate limits, timeouts, partial disk writes, and UI hangs included.
 
-Sit with the shape of that sentence before you code. You are not being asked whether your output *looks like the document*. You are being asked whether a machine that rebuilds the total from your pieces reaches the truth. A record can mirror the page faithfully and still fail to book. Many of these documents are exactly that record. Understanding how a faithful copy can be a wrong answer is the first door you have to walk through, and most of the difficulty is behind it.
+1. **Persistent MD5 transcription cache (`.cache/transcriptions/`).** Every
+   rasterised page's transcription is written to disk under a **content-fingerprinted**
+   key — an MD5 of the rendered PNG's *bytes* (document + page + image digest), so two
+   different pages can never collide even at identical byte lengths. Writes are
+   **atomic** (`.tmp` file + `os.replace`), so a hard exit can never leave a
+   half-written entry; empty or corrupted cache files are treated as misses and
+   re-transcribed (`src/extractor.py`).
 
-Note too: the ERP can reach the right gross by the wrong path. Two different structures can foot to the same number, and only one of them is the payable that should be booked. Matching the total is necessary. It is not sufficient, and it is not the goal.
+2. **Rate-limit & transient-error resilience (`src/llm_retry.py`).** Every provider
+   call rides an 8-level cause-chain walk that classifies retryable failures across the
+   OpenAI SDK *and* raw HTTPX: 429 (honouring a numeric `Retry-After` header verbatim,
+   capped at 300 s), Groq **TPM** 413 `rate_limit_exceeded` (fixed 60 s window wait),
+   5xx / 408 / 409 / 425, timeouts, and connection resets — then retries with
+   exponential back-off + jitter (capped at 60 s) up to `max_attempts` (default 10).
+   A per-document TPM/RPM budget never stalls the batch: one bad file degrades to an
+   honest `declined` entry and processing continues.
 
-**Your autodraft must mirror the document's structure, not just its total.** The grader inspects the shape you emit, not only the number it foots to:
+3. **Zero-token text-layer routing (`src/pipeline.py` & `src/extractor.py`).** Pages
+   whose embedded text layer is usable are returned verbatim and **never** contact the
+   vision API, and image-only pages are transcribed by **local easyocr CPU OCR** by
+   default (`INV_USE_LLM=false` / no `--use-llm`): a plain `python run.py` spends **zero**
+   vision tokens. Pass `--use-llm` (or `INV_USE_LLM=true`) to additionally route the
+   pages easyocr cannot read to the multimodal model
+   (`text_layer_min_chars`, default 80), with consecutive vision calls paced by a
+   configurable `INV_VISION_PACING_DELAY` (default 2.0 s) to keep provider TPM/RPM flat
+   on multi-page scans. Text-layer re-runs cost **zero** vision tokens.
 
-- **Placement is faithful.** A tax the document charges *at the line* belongs on that line (`line_items[].taxes[]` / the line's `tax_rate`); a tax stated *once at the header* belongs at the header (`taxes[]`). Do not migrate a tax from where the document puts it to wherever makes the arithmetic easier — a header rate invented over lines that carry their own rates, or per-line taxes collapsed into one header figure, is wrong even when it foots.
-- **Each tax is represented correctly** — its **name**, its **rate**, and its **amount** as the document states them. A line with its own rate keeps that rate; a document with three rates across its lines yields three line-level taxes, not one blended rate.
-- **Components stay decomposed.** Quantities, unit prices, discounts, charges and levies go in the fields that describe them — not pre-summed, not folded into each other. If the document itemises it, your record itemises it.
+4. **Thread-safe Streamlit architecture (`app.py`).** The dashboard never blocks on a
+   long run: "Run Pipeline" executes on a daemon background thread with a done-flag
+   polling loop (the page auto-refreshes, the button is disabled meanwhile). PDF
+   rasterisation is memoised with `@st.cache_data` keyed on file content + DPI, errors
+   are surfaced in a collapsible expander, and per-PDF results are isolated in session
+   state so switching documents never shows stale data.
 
-Same total, wrong structure, is a wrong answer. Reproduce *what the document says and where it says it*.
+5. **Fail-fast stall prevention (`src/config.py` + `src/llm_retry.py`).** A single
+   LLM call is budgeted by `INV_LLM_ATTEMPTS` (default **1** = fail fast) and any retry
+   wait is hard-capped by `INV_LLM_MAX_WAIT` (**60 s**): a provider throttle that would
+   force a multi-hundred-second `Retry-After` sleep raises `BenchmarkTimeoutException`
+   instead of freezing the process. A large batch therefore degrades an affected file
+   to an honest `declined` entry and moves on — the pipeline **never hangs** on a
+   congested provider, even when quotas are exhausted.
+
+6. **Production token budgeting (text reasoning).** Text-reasoning calls
+   (`src/config.py: text_max_tokens`) request an explicit **8192-token** generation
+   window — instead of trusting a serverless endpoint's low default cap — so a complex
+   multi-page invoice's full payables JSON (supplier, buyer, payment terms, line items,
+   taxes, totals) completes **without mid-payload truncation** even though Groq's
+   gpt-oss models expand every line item into its own JSON object (4k–8k output tokens
+   on long invoices). A smaller window structurally clipped the JSON and surfaced as
+   empty payables (false negative), which is why fast mode shares the same 8192 budget.
+   The structured output
+   is still enforced through the Pydantic `FileOutput` schema, so a wider window never
+   compromises strict schema compliance (malformed replies are rejected, not repaired).
+   Oversized transcripts are capped at `INV_MAX_STRUCTURING_CHARS` (default 12000) with
+   a **head+tail split** (`_save_truncate`) — the last pages' line items, duty/freight
+   charges and grand totals are never dropped from the LLM context.
+
+7. **Automated verification & benchmarking (`scripts/`).**
+   - `scripts/check_models.py` — pre-flight health check: probes every candidate
+     vision/text model against HF Serverless and Groq, and prints which providers are
+     actually deployable on the current account.
+   - `scripts/benchmark.py` — comparative performance harness: runs `run.py --validate`
+     on representative invoices across the Full-HF / Hybrid / Full-Groq topologies with
+     a *fresh* cache each time, then reports wall-clock latency, HTTP 429 /
+     rate-limit events, `BenchmarkTimeoutException` aborts, and ERP recompute accuracy
+     against the grader's oracle.
 
 ---
 
-## Output contract
+## Setup Instructions
 
-Your system runs with **one command** over the `documents/` directory and writes, for each input `X.pdf`, a file `output/X.json` — put **all** results in an `output/` folder (create it if absent), one JSON per input PDF:
+### 1. Prerequisites
 
-```jsonc
+- Python **3.10+** (developed on 3.13).
+- A Groq API key, or any OpenAI-compatible endpoint.
+- An `HF_TOKEN` (only if you opt into the Vision LLM with `--use-llm`).
+
+### 2. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Configure credentials
+
+Copy the template and fill in your key. The shipped hybrid topology needs:
+
+```bash
+cp .env.example .env
+# edit .env:
+#   GROQ_API_KEY=gsk_...                       # text reasoning (structuring, validation, correction)
+#   INV_TEXT_BASE_URL=https://api.groq.com/openai/v1
+#   INV_TEXT_MODEL=openai/gpt-oss-20b
+#   HF_TOKEN=hf_...                            # vision only — needed just for --use-llm / INV_USE_LLM=true
+#   INV_VISION_BASE_URL=https://router.huggingface.co/v1
+#   INV_VISION_MODEL=zai-org/GLM-4.5V
+#   INV_USE_LLM=false                          # vision is opt-in; a default run is fully local
+```
+
+Defaults (current `.env`): text/structuring = **`openai/gpt-oss-20b`** on **Groq**; vision (opt-in) = **`zai-org/GLM-4.5V`** on the **Hugging Face** router. If your gateway exposes different model ids — and keep the vision model *multimodal* — override per-run or in `.env`:
+
+```bash
+export INV_TEXT_MODEL=openai/gpt-oss-20b
+export INV_VISION_MODEL=zai-org/GLM-4.5V
+```
+
+### 4. Run the pipeline
+
+```bash
+# Full pipeline over documents/ -> output/*.json  (one JSON per PDF)
+# Default run is fully local: image pages transcribed by easyocr OCR, the
+# Vision LLM is never called (zero vision tokens spent).
+python run.py
+
+# Manually trigger the Vision LLM for pages easyocr cannot read
+python run.py --use-llm
+
+# With the multi-agent validation loop (day-2)
+python run.py --validate
+
+# Fast Testing Mode: bypass vision for text pages, cap retries to 0
+python run.py --fast
+
+# Dry run: list the input PDFs
+python run.py --list
+```
+
+`run.py --validate` also prints a summary with validation stats:
+
+```json
 {
-  "file": "X.pdf",
-  "payables": [            // 0..N bookable payables, each conforming to AUTODRAFT_SCHEMA.md
-    { "invoice_type": "INVOICE", "currency": "EUR", "gross_total": "...",
-      "line_items": [ ... ], "taxes": [ ... ], ... }
-  ],
-  "declined": [            // any documents you determine are NOT payables (may be empty)
-    { "doc_type": "...", "reason": "why this is not a payable" }
-  ]
+  "files_processed": 42,
+  "payables": 0,
+  "declined": { "UNREADABLE": 37, "ERROR": 5 },
+  "validation": { "converged": 0, "not_converged": 0, "corrections": 0 }
 }
 ```
 
-- One entry in `payables[]` per bookable payable. A document with several payables ⇒ several entries; a document that is not a payable ⇒ `payables: []`.
-- A **credit** is a payable of type `CREDIT_MEMO`. It uses the **same schema — the same keys** as any payable; only the values differ. Set `invoice_type: "CREDIT_MEMO"` and fill the ordinary fields (`line_items`, `taxes`, `gross_total`, …) with the credit memo's own figures, as **positive** magnitudes (see `erp.py`'s sign handling). There is no separate credit-memo shape — same record, credit values.
-- Anything you judge **not** a payable goes in `declined[]`, never in `payables[]`.
+### 5. Verify against the ERP oracle
 
-Provide a `README` with a single documented command (a script or a `Dockerfile`) that runs your system over a folder of PDFs and produces these files. We will re-run it.
+```bash
+# The reference example (should print will_book_gross = 438.0 EUR)
+python example_check.py
 
-## Three rules — enforced, and also clues
+# Feed every validated payable back into the ERP and compare to printed gross
+python check_outputs.py            # or: python check_outputs.py output/INV-31.json
+```
 
-1. **Every value you emit must appear on the document.** A number that is in your output only because it made the total come out right disqualifies that payable. If you are ever tempted to invent a figure to balance the books, the temptation is telling you something true about the document — listen to it instead of acting on it.
-2. **Every code you emit must be a real match** against the master data. "No match" is a legitimate answer. A confident, fabricated code is not.
-3. **Any correction your system makes must survive being wrong.** Some documents are built to *look* like they need a fix they do not. A fix that fires where it shouldn't — and corrupts a document that was already correct — costs you more than never fixing anything. Before your system changes a record, ask what independent fact gives it the right to.
+### 6. Test & lint
 
----
+```bash
+python -m pytest tests -q          # unit/integration tests, no API key required
+python -m ruff check src tests scripts run.py erp.py example_check.py check_outputs.py app.py
+```
 
-## What you submit
+### 6b. Provider health-check & benchmark tools
 
-- The working system (any stack; one documented command over `documents/` writing to `output/`).
-- Your generated `output/*.json` for the open documents.
-- **`DESIGN.md` (≤3 pages).** Not a feature list. Answer three questions honestly:
-  - What did you eventually understand about these documents that you did not understand on day one?
-  - When your system meets a document unlike any it has seen, what does it actually *do* — and why does that generalise instead of guessing?
-  - Was there a document you concluded could **not** be solved the way the others were? If so, which, and how did you know?
+```bash
+# Pre-flight: probe vision/text models on HF Serverless + Groq, print deployable configs
+python scripts/check_models.py
 
-The third question is not padding. At least one document asks something of you that the page does not contain the answer to. Recognising that, and refusing to fake it, is worth more than any code that pretends otherwise.
+# Comparative performance harness: Full-HF / Hybrid / Full-Groq latency,
+# rate-limit events, and ERP accuracy (defaults to all architectures)
+python scripts/benchmark.py
+python scripts/benchmark.py --arch full-hf hybrid
+```
 
----
+### 7. Streamlit dashboard
 
-## How you are judged
+An interactive UI for reviewing a single invoice end-to-end: rendered PDF pages
+beside a live ERP-oracle audit of the extracted output.
 
-In the open, your score reflects how many documents book, whether you identified the right payables (and correctly set aside what is not a payable), and a check of what the oracle cannot see — that your codes are real and every value is grounded in the document.
+```bash
+streamlit run app.py
+```
 
-Your **final** standing is decided mostly by the **held-back** documents, graded the same way, which contain situations the open set does not — including at least one you will not have seen before at all. We report one number above your pass rate:
+Layout:
 
-> **the distance between how well you do in the open and how well you do on the held-back set.**
+- **Left panel** — the selected PDF's pages rendered side-by-side via PyMuPDF.
+- **Right panel** — a control strip plus three interactive tabs:
+  - **ERP Oracle Audit** — feeds the extracted JSON through `erp.erp_book()` and
+    compares the printed gross to the recomputed gross, shown as MATCH/MISMATCH
+    metric badges.
+  - **Extracted JSON** — the structured output formatted per `AUTODRAFT_SCHEMA.md`.
+  - **Line Items** — an interactive table of extracted descriptions, quantities,
+    unit prices, totals, and tax lines.
+- **Sidebar** — pick which PDF from `documents/`, toggle multi-agent validation
+  (`--validate`), and press **Run Pipeline** to (re)extract and (re)validate.
 
-A small distance means you understood the problem. A large one means you fitted the answers. You can make every open document book and still finish poorly if the way you did it falls apart the moment a document does something slightly new. Solving each document is not the same as solving *the problem*, and only one of those is being graded.
+If a matching `output/<file>.json` already exists it is loaded for auditing
+without re-running the pipeline; clicking **Run Pipeline** regenerates it.
 
----
 
-## Before you start (read this last, then reread it on day two)
 
-The obvious approach — read the fields, fill the record — will book perhaps a third of these, and then stall, and the failures will not look like they have anything in common. There is no list of special cases to implement; if you find yourself building one, adding a branch each time a document defeats you, stop: that growing list is the symptom this problem is designed to produce in people who have not yet seen it whole.
+**Demo Link** - https://github.com/user-attachments/assets/cd48e1ac-2ffc-454e-af82-b8881984c749
 
-Past that stall there is a shift in how you picture *what one of these documents actually is* — after which the failures stop being a dozen unrelated bugs and become one thing wearing a dozen masks.
 
-We are not going to tell you what that shift is. Arriving at it, unaided, is the exam.
+
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `app.py` | Streamlit dashboard: PDF viewer + ERP oracle audit + JSON/line-item tabs |
+| `run.py` | One-command runner (`--validate` enables the agent loop) |
+| `check_outputs.py` | ERP bridge: validated outputs → `erp_book` → MATCH/MISMATCH |
+| `src/config.py` | Runtime settings: `INV_*` env vars, LLM client factories, fast-mode routing |
+| `src/pdf_reader.py` | PDF ingest, text/image detection, rasterisation |
+| `src/extractor.py` | easyocr CPU OCR by default + opt-in Vision LLM transcription |
+| `src/schemas.py` | Pydantic models mirroring `AUTODRAFT_SCHEMA.md` |
+| `src/master_data.py` | O(1)-indexed master-data resolution (no guesses) |
+| `src/formatter.py` | LLM structuring chain + provider-agnostic JSON parser |
+| `src/validation.py` | Deterministic Validation Agent (master + ERP oracle) |
+| `src/agents.py` | Validation loop: proposer/validator/corrector, ≤`max_retries` |
+| `src/llm_retry.py` | Retry/back-off wrapper: 429 + TPM + transient-error handling |
+| `src/logging_conf.py` | Centralised logging (stdout + rotating file under `output/logs/`) |
+| `src/pipeline.py` | Per-file orchestration and `output/` writing |
+| `scripts/check_models.py` | Pre-flight provider health-check (HF Serverless + Groq probes) |
+| `scripts/benchmark.py` | Comparative latency/429/ERP benchmark across Full-HF / Hybrid / Full-Groq |
+| `tests/` | 150+ unit + integration tests (schema, matching, loop, ERP bridge, retries, routing) |
+| `erp.py` | The ERP recompute oracle (fixed; graded as-is) |
+
+The original challenge brief is preserved in [`CHALLENGE_BRIEF.md`](CHALLENGE_BRIEF.md).

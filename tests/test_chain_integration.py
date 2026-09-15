@@ -1,11 +1,11 @@
 """Integration test: the real LangChain structuring chain wired end-to-end.
 
 Drives the chain built by :func:`src.formatter.build_autodraft_chain`
-(prompt + ``with_structured_output``) end-to-end, with the network boundary
-replaced: ``ChatOpenAI.with_structured_output`` is stubbed so the schema is
-still the real :class:`src.schemas.FileOutput` and responses are still
-Pydantic-validated. This catches real composition regressions (e.g. the
-system prompt's literal ``{}`` breaking prompt templating) without an API key.
+(prompt -> chat model -> pydantic parser) end-to-end, with the network
+boundary replaced: ``ChatOpenAI.invoke`` is stubbed so the schema is still the
+real :class:`src.schemas.FileOutput` and responses are still Pydantic-validated
+by the parser. This catches real composition regressions (e.g. the system
+prompt's literal ``{}`` breaking prompt templating) without an API key.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 import src.formatter as formatter
-from langchain_core.runnables import RunnableLambda
+from langchain_core.messages import AIMessage
 from src.master_data import MasterData
 from src.schemas import FileOutput
 
@@ -77,21 +77,19 @@ _SAMPLE_RESPONSE = json.dumps(
 )
 
 
+def _stub_invoke(self, messages):
+    """Return the canned sample JSON for ANY message list."""
+    return AIMessage(content=_SAMPLE_RESPONSE)
+
+
 @pytest.fixture
-def stub_structured_output(monkeypatch) -> None:
-    """Replace the OpenAI structured-output call with a schema-validated stub."""
+def stub_chat(monkeypatch) -> None:
+    """Replace the network-bound chat call with a canned JSON reply."""
     monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-really-used")
-
-    def _fake_with_structured(self, schema, *, method=None, **kwargs):
-        def _run(_inputs: dict) -> FileOutput:
-            return schema.model_validate_json(_SAMPLE_RESPONSE)
-
-        return RunnableLambda(_run, name="stubbed_structured_output")
-
-    monkeypatch.setattr(formatter.ChatOpenAI, "with_structured_output", _fake_with_structured)
+    monkeypatch.setattr(formatter.ChatOpenAI, "invoke", _stub_invoke)
 
 
-def test_chain_composes_and_validates(stub_structured_output) -> None:
+def test_chain_composes_and_validates(stub_chat) -> None:
     chain = formatter.build_autodraft_chain(model="gpt-4o-mini", temperature=0.0)
     result: FileOutput = chain.invoke({"document_text": "Some invoice text"})
     assert len(result.payables) == 1
@@ -102,7 +100,7 @@ def test_chain_composes_and_validates(stub_structured_output) -> None:
     assert payable.line_items[0].item_type == "SERVICE"
 
 
-def test_format_autodraft_end_to_end_resolves_codes(stub_structured_output) -> None:
+def test_format_autodraft_end_to_end_resolves_codes(stub_chat) -> None:
     master = MasterData.load(Path(__file__).resolve().parent.parent / "master_data")
     result = formatter.format_autodraft(
         _SAMPLE_RESPONSE,
@@ -113,3 +111,28 @@ def test_format_autodraft_end_to_end_resolves_codes(stub_structured_output) -> N
     assert result.file == "INV-99.pdf"
     assert result.payables[0].supplier.supplier_id == "2845695"
     assert result.payables[0].taxes[0].tax_type_code == "DE_000_RC"
+
+
+def test_parser_tolerates_missing_declined(monkeypatch) -> None:
+    """Omitted defaulted fields (common on smaller providers) must fall back."""
+    combo = formatter._finalize(FileOutput)
+    result = combo.invoke('{"file":"X.pdf","payables":[]}')
+    assert result.file == "X.pdf"
+    assert result.declined == []  # default restored by the parser
+
+
+def test_parser_drops_undeclared_fields() -> None:
+    """Invented fields (e.g. buyer.name on some models) must be dropped, not fatal."""
+    messy = (
+        '{"file":"X.pdf","payables":[{"invoice_number":"1","currency":"EUR",'
+        '"supplier":{"name":"Acme","supplier_id":"","fax":"+1-555","vat_id":""},'
+        '"buyer":{"company_code":"","business_unit_code":"","location_code":"","name":"Buyer Ltd","address":"1 St"}}],'
+        '"declined":[]}'
+    )
+    combo = formatter._finalize(FileOutput)
+    result = combo.invoke(messy)
+    p = result.payables[0]
+    assert p.supplier.name == "Acme"
+    assert not hasattr(p.supplier, "fax")
+    assert not hasattr(p.buyer, "name")
+    assert not hasattr(p.buyer, "address")
