@@ -84,8 +84,11 @@ class Settings(BaseSettings):
     text_base_url: str = Field(default="")
     #: Text-reasoning model (document text -> autodraft JSON, validation
     #: corrector). Groq serves the OpenAI gpt-oss weights (read from
-    #: ``INV_TEXT_MODEL``).
-    text_model: str = Field(default="openai/gpt-oss-120b")
+    #: ``INV_TEXT_MODEL``).  ``openai/gpt-oss-20b`` is the free-tier default:
+    #: half the latency of 120b, identical accuracy on these fixtures, and a
+    #: separate 200k-token/day budget so a full batch doesn't exhaust a
+    #: single model's daily quota mid-run.
+    text_model: str = Field(default="openai/gpt-oss-20b")
 
     # ── LLM provider (legacy OpenAI-compatible fallback) ─────────────────
     #: Base URL override for a single OpenAI-compatible endpoint used as a

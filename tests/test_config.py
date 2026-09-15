@@ -41,15 +41,16 @@ def test_fast_mode_short_circuits_retries_pacing_and_vision() -> None:
 def test_hybrid_provider_defaults() -> None:
     """Vision targets HF Serverless; text reasoning targets Groq's gpt-oss.
 
-    Constructed with explicit values (hermetic — never coupled to the local
-    ``.env``), mirroring the deployed default topology: vision on the HF
+    Constructed with explicit values (hermetic -- never coupled to the local
+    .env), mirroring the deployed default topology: vision on the HF
     router (opt-in; easyocr is the local default), text reasoning rides
-    Groq's OpenAI-compatible endpoint serving the openai gpt-oss weights.
+    Groq's OpenAI-compatible endpoint serving the openai gpt-oss-20b
+    weights (faster than 120b, separate 200k/day TPD budget).
     """
     cfg = Settings(
         vision_model="zai-org/GLM-4.5V",
         vision_base_url="https://router.huggingface.co/v1",
-        text_model="openai/gpt-oss-120b",
+        text_model="openai/gpt-oss-20b",
         text_base_url="https://api.groq.com/openai/v1",
         groq_base_url="https://api.groq.com/openai/v1",
         fast_structuring_model="openai/gpt-oss-20b",
@@ -58,7 +59,7 @@ def test_hybrid_provider_defaults() -> None:
     assert cfg.vision_model == "zai-org/GLM-4.5V"
     assert cfg.vision_base_url == "https://router.huggingface.co/v1"
     # Text reasoning follows INV_TEXT_MODEL / INV_TEXT_BASE_URL when set.
-    assert cfg.text_model == "openai/gpt-oss-120b"
+    assert cfg.text_model == "openai/gpt-oss-20b"
     assert cfg.text_base_url == "https://api.groq.com/openai/v1"
     assert cfg.groq_base_url == "https://api.groq.com/openai/v1"
     assert cfg.structuring_model == ""  # no override -> text_model wins

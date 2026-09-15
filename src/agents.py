@@ -18,7 +18,7 @@ last produced autodraft (and its remaining issues) is always returned.
 Hybrid provider architecture: vision transcription runs on the Hugging Face
 Serverless router (:meth:`Settings.get_vision_llm`), while all text reasoning
 here — proposer and corrector — runs on Groq (:meth:`Settings.get_text_llm`,
-``INV_TEXT_MODEL``, default ``openai/gpt-oss-120b``).
+``INV_TEXT_MODEL``, default ``openai/gpt-oss-20b``).
 """
 
 from __future__ import annotations
